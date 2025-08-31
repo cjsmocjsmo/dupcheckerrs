@@ -9,7 +9,7 @@ use std::fs;
 use std::time::Instant;
 
 const DB_PATH: &str = "/home/whitepi/rust/dupcheckerrs/images.db";
-const SEARCH_DIR: &str = "/media/whitepi/ATree/";
+const SEARCH_DIR: &str = "/media/whitepi/ATree";
 
 fn main() -> Result<()> {
     let start = Instant::now();
