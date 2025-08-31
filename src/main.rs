@@ -13,6 +13,7 @@ const SEARCH_DIR: &str = "/media/whitepi/ATree";
 
 fn main() -> Result<()> {
     let start = Instant::now();
+    let mut image_count = 0u64;
 
     // Open or create the database
     let conn = Connection::open(DB_PATH)?;
@@ -31,6 +32,7 @@ fn main() -> Result<()> {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
             if ext == "jpg" || ext == "jpeg" {
                 println!("Processing: {}", path.display());
+                image_count += 1;
                 let img_result = ImageReader::open(path)
                     .and_then(|r| r.decode().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
                 match img_result {
@@ -55,5 +57,6 @@ fn main() -> Result<()> {
 
     let elapsed = start.elapsed();
     println!("Done. Elapsed time: {:.2?}", elapsed);
+    println!("Total images processed: {}", image_count);
     Ok(())
 }
