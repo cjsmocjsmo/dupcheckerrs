@@ -1,0 +1,10 @@
+[package]
+name = "dupcheckerrs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusqlite = "0.31"
+walkdir = "2.5"
+img_hash = "3.2"
+time = "0.3"
