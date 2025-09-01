@@ -64,6 +64,10 @@ fn main() -> Result<()> {
             Err(e) => {
                 // Could not open image, print the path and error
                 println!("Could not open image: {} (reason: {})", path.display(), e);
+                let msg = e.to_string();
+                if msg.contains("failed to fill whole buffer") || msg.contains("invalid JPEG format: first two bytes are not an SOI marker") || msg.contains("error") {
+                    let _ = std::fs::remove_file(path);
+                }
                 *error_count.lock().unwrap() += 1;
             }
         }
