@@ -46,9 +46,9 @@ fn main() -> Result<()> {
                             params![hash_str, path_str],
                         );
                     }
-                    Err(_) => {
-                        // Could not open image, print the path
-                        println!("Could not open image: {}", path.display());
+                    Err(e) => {
+                        // Could not open image, print the path and error
+                        println!("Could not open image: {} (reason: {})", path.display(), e);
                     }
                 }
             }
