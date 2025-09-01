@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 rusqlite = "0.31"
 walkdir = "2.5"
-img_hash = { version = "3.2", features = ["jpeg"] }
+img_hash = "3.2"
+image = { version = "0.23", features = ["jpeg"] }
 time = "0.3"
