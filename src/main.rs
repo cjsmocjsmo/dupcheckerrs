@@ -31,7 +31,7 @@ fn main() -> Result<()> {
         if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
             if ext == "jpg" || ext == "jpeg" {
-                println!("Processing: {}", path.display());
+                // println!("Processing: {}", path.display());
                 image_count += 1;
                 let img_result = ImageReader::open(path)
                     .and_then(|r| r.decode().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
@@ -47,8 +47,8 @@ fn main() -> Result<()> {
                         );
                     }
                     Err(_) => {
-                        // Could not open image, delete file
-                        let _ = fs::remove_file(path);
+                        // Could not open image, print the path
+                        println!("Could not open image: {}", path.display());
                     }
                 }
             }
