@@ -92,5 +92,31 @@ fn main() -> Result<()> {
     println!("Done. Elapsed time: {:.2?}", elapsed);
     println!("Total images processed: {}", total);
     println!("Total errors: {}", errors);
+
+    // Move all unique images to RustMasterPics
+    use std::fs;
+    use std::path::Path;
+    let dest_dir = "/media/whitepi/ATree/RustMasterPics";
+    if !Path::new(dest_dir).exists() {
+        if let Err(e) = fs::create_dir_all(dest_dir) {
+            eprintln!("Failed to create {}: {}", dest_dir, e);
+            return Ok(());
+        }
+    }
+    let mut stmt = conn.prepare("SELECT path FROM hashes")?;
+    let paths = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for path_result in paths {
+        if let Ok(path_str) = path_result {
+            let src = Path::new(&path_str);
+            if src.exists() {
+                let filename = src.file_name().unwrap_or_default();
+                let dest_path = Path::new(dest_dir).join(filename);
+                if let Err(e) = fs::rename(src, &dest_path) {
+                    eprintln!("Failed to move {} to {}: {}", src.display(), dest_path.display(), e);
+                }
+            }
+        }
+    }
+    println!("All unique images moved to {}", dest_dir);
     Ok(())
 }
