@@ -9,3 +9,5 @@ walkdir = "2.5"
 img_hash = "3.2"
 image = { version = "0.23", features = ["jpeg"] }
 time = "0.3"
+rayon = "1.10"
+indicatif = "0.17"

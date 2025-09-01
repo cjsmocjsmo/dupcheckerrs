@@ -1,11 +1,13 @@
+use rayon::iter::IntoParallelRefIterator;
+
 
 use rusqlite::{params, Connection, Result};
 use walkdir::WalkDir;
 use img_hash::image::io::Reader as ImageReader;
 use img_hash::{HasherConfig, HashAlg};
-
-// use std::fs;
-
+use rayon::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const DB_PATH: &str = "/home/whitepi/rust/dupcheckerrs/images.db";
@@ -13,10 +15,9 @@ const SEARCH_DIR: &str = "/media/whitepi/ATree";
 
 fn main() -> Result<()> {
     let start = Instant::now();
-    let mut image_count = 0u64;
 
     // Open or create the database
-    let conn = Connection::open(DB_PATH)?;
+    let mut conn = Connection::open(DB_PATH)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS hashes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,37 +27,66 @@ fn main() -> Result<()> {
         [],
     )?;
 
-    for entry in WalkDir::new(SEARCH_DIR).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if ext == "jpg" || ext == "jpeg" {
-                println!("Processing: {}", path.display());
-                image_count += 1;
-                let img_result = ImageReader::open(path)
-                    .and_then(|r| r.decode().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-                match img_result {
-                    Ok(img) => {
-                        let hasher = HasherConfig::new().hash_alg(HashAlg::Mean).to_hasher();
-                        let hash = hasher.hash_image(&img);
-                        let hash_str = hash.to_base64();
-                        let path_str = path.to_string_lossy();
-                        let _ = conn.execute(
-                            "INSERT OR IGNORE INTO hashes (hash, path) VALUES (?1, ?2)",
-                            params![hash_str, path_str],
-                        );
-                    }
-                    Err(e) => {
-                        // Could not open image, print the path and error
-                        println!("Could not open image: {} (reason: {})", path.display(), e);
-                    }
-                }
+    // Collect all image file paths first
+    let image_paths: Vec<_> = WalkDir::new(SEARCH_DIR)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|entry| {
+            entry.path().is_file() && {
+                let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                ext == "jpg" || ext == "jpeg"
+            }
+        })
+        .map(|entry| entry.path().to_owned())
+        .collect();
+
+    let pb = ProgressBar::new(image_paths.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .unwrap()
+        .progress_chars("#>-"));
+
+    // Use Arc<Mutex<>> to collect results from threads
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let error_count = Arc::new(Mutex::new(0u64));
+
+    image_paths.par_iter().for_each(|path| {
+        let img_result = ImageReader::open(path)
+            .and_then(|r| r.decode().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        match img_result {
+            Ok(img) => {
+                let hasher = HasherConfig::new().hash_alg(HashAlg::Mean).to_hasher();
+                let hash = hasher.hash_image(&img);
+                let hash_str = hash.to_base64();
+                let path_str = path.to_string_lossy().to_string();
+                results.lock().unwrap().push((hash_str, path_str));
+            }
+            Err(e) => {
+                // Could not open image, print the path and error
+                println!("Could not open image: {} (reason: {})", path.display(), e);
+                *error_count.lock().unwrap() += 1;
             }
         }
+        pb.inc(1);
+    });
+    pb.finish_with_message("Processing done");
+
+    // Batch insert into DB
+    let results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    let tx = conn.transaction()?;
+    for (hash_str, path_str) in results {
+        let _ = tx.execute(
+            "INSERT OR IGNORE INTO hashes (hash, path) VALUES (?1, ?2)",
+            params![hash_str, path_str],
+        );
     }
+    tx.commit()?;
 
     let elapsed = start.elapsed();
+    let total = image_paths.len();
+    let errors = Arc::try_unwrap(error_count).unwrap().into_inner().unwrap();
     println!("Done. Elapsed time: {:.2?}", elapsed);
-    println!("Total images processed: {}", image_count);
+    println!("Total images processed: {}", total);
+    println!("Total errors: {}", errors);
     Ok(())
 }
