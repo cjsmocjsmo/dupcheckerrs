@@ -4,7 +4,7 @@ use walkdir::WalkDir;
 use img_hash::image::io::Reader as ImageReader;
 use img_hash::{HasherConfig, HashAlg};
 
-use std::fs;
+// use std::fs;
 
 use std::time::Instant;
 
