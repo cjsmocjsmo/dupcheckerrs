@@ -28,6 +28,11 @@ enum ProcessResult {
 fn main() -> Result<()> {
     let start = Instant::now();
 
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build_global()
+        .expect("failed to configure rayon thread pool");
+
     // Open or create the database
     let mut conn = Connection::open(DB_PATH)?;
     conn.execute(
