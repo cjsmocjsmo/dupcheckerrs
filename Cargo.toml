@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rusqlite = "0.31"
+rusqlite = { version = "0.31", features = ["bundled"] }
 walkdir = "2.5"
 img_hash = "3.2"
 image = { version = "0.23", features = ["jpeg"] }

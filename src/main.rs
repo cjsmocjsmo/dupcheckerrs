@@ -1,6 +1,4 @@
 use rayon::iter::IntoParallelRefIterator;
-
-
 use rusqlite::{params, Connection, Result};
 use walkdir::WalkDir;
 use img_hash::image::io::Reader as ImageReader;
@@ -10,8 +8,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const DB_PATH: &str = "/home/whitepi/rust/dupcheckerrs/images.db";
-const SEARCH_DIR: &str = "/media/whitepi/ATree";
+const DB_PATH: &str = "/media/PiTB/images.db";
+const SEARCH_DIR: &str = "/media/PiTB/foofuck";
+const DEST_DIR: &str = "/media/PiTB/RustMasterPics";
 
 fn main() -> Result<()> {
     let start = Instant::now();
@@ -96,10 +95,10 @@ fn main() -> Result<()> {
     // Move all unique images to RustMasterPics
     use std::fs;
     use std::path::Path;
-    let dest_dir = "/media/whitepi/ATree/RustMasterPics";
-    if !Path::new(dest_dir).exists() {
-        if let Err(e) = fs::create_dir_all(dest_dir) {
-            eprintln!("Failed to create {}: {}", dest_dir, e);
+    // let dest_dir = "/media/whitepi/ATree/RustMasterPics";
+    if !Path::new(DEST_DIR).exists() {
+        if let Err(e) = fs::create_dir_all(DEST_DIR) {
+            eprintln!("Failed to create {}: {}", DEST_DIR, e);
             return Ok(());
         }
     }
@@ -110,13 +109,13 @@ fn main() -> Result<()> {
             let src = Path::new(&path_str);
             if src.exists() {
                 let filename = src.file_name().unwrap_or_default();
-                let dest_path = Path::new(dest_dir).join(filename);
+                let dest_path = Path::new(DEST_DIR).join(filename);
                 if let Err(e) = fs::rename(src, &dest_path) {
                     eprintln!("Failed to move {} to {}: {}", src.display(), dest_path.display(), e);
                 }
             }
         }
     }
-    println!("All unique images moved to {}", dest_dir);
+    println!("All unique images moved to {}", DEST_DIR);
     Ok(())
 }
