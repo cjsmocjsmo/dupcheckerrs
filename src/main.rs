@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, Result};
 use walkdir::WalkDir;
-use img_hash::image::{self, DynamicImage, ImageOutputFormat};
+use img_hash::image::{self, DynamicImage, ImageOutputFormat, GrayImage};
+use img_hash::image::imageops::FilterType;
 use img_hash::{HashAlg, HasherConfig};
 use crossbeam_channel::{bounded, RecvTimeoutError};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -14,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs, io};
 use time::OffsetDateTime;
+use turbojpeg;
 
 const ENV_DRY_RUN: &str = "DUPCHECKERRS_DRY_RUN";
 const ENV_WORKERS: &str = "DUPCHECKERRS_WORKERS";
@@ -29,6 +31,7 @@ const ENV_MAX_CONSOLE_ERRORS: &str = "DUPCHECKERRS_MAX_CONSOLE_ERRORS";
 const ENV_PATH_QUEUE_CAP: &str = "DUPCHECKERRS_PATH_QUEUE_CAP";
 const ENV_RESULT_QUEUE_CAP: &str = "DUPCHECKERRS_RESULT_QUEUE_CAP";
 const ENV_JPEG_QUALITY: &str = "DUPCHECKERRS_JPEG_QUALITY";
+const ENV_HASH_DOWNSCALE_SIZE: &str = "DUPCHECKERRS_HASH_DOWNSCALE_SIZE";
 
 const DEFAULT_DB_PATH: &str = "/media/PiTB/images.db";
 const DEFAULT_SEARCH_DIR: &str = "/media/PiTB/foofuck/Camera1";
@@ -42,6 +45,7 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 15;
 const DEFAULT_STALL_WARN_SECS: u64 = 120;
 const DEFAULT_WORKERS: usize = 3;
 const DEFAULT_JPEG_QUALITY: u8 = 95;
+const DEFAULT_HASH_DOWNSCALE_SIZE: u32 = 64;
 
 struct RuntimeConfig {
     dry_run: bool,
@@ -58,11 +62,14 @@ struct RuntimeConfig {
     path_queue_cap: usize,
     result_queue_cap: usize,
     jpeg_quality: u8,
+    hash_downscale_size: u32,
 }
 
 impl RuntimeConfig {
     fn from_env() -> Self {
         let jpeg_quality = env_u8(ENV_JPEG_QUALITY, DEFAULT_JPEG_QUALITY).clamp(1, 100);
+        let hash_downscale_size = env_u32(ENV_HASH_DOWNSCALE_SIZE, DEFAULT_HASH_DOWNSCALE_SIZE)
+            .clamp(8, 512);
         RuntimeConfig {
             dry_run: env_flag(ENV_DRY_RUN),
             workers: env_usize(ENV_WORKERS, DEFAULT_WORKERS),
@@ -78,6 +85,7 @@ impl RuntimeConfig {
             path_queue_cap: env_usize(ENV_PATH_QUEUE_CAP, DEFAULT_PATH_QUEUE_CAP),
             result_queue_cap: env_usize(ENV_RESULT_QUEUE_CAP, DEFAULT_RESULT_QUEUE_CAP),
             jpeg_quality,
+            hash_downscale_size,
         }
     }
 }
@@ -294,6 +302,14 @@ fn env_u8(name: &str, default: u8) -> u8 {
         .unwrap_or(default)
 }
 
+    fn env_u32(name: &str, default: u32) -> u32 {
+        env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+    }
+
 fn env_string(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
@@ -349,13 +365,14 @@ fn main() -> Result<()> {
         workers, ENV_WORKERS
     );
     eprintln!(
-        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} queue_caps=({}, {}) max_console_errors={}",
+        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} queue_caps=({}, {}) max_console_errors={}",
         config.search_dir,
         config.db_path,
         heartbeat_secs,
         stall_warn_secs,
         progress_enabled,
         config.jpeg_quality,
+        config.hash_downscale_size,
         config.path_queue_cap,
         config.result_queue_cap,
         config.max_console_errors
@@ -463,6 +480,7 @@ fn main() -> Result<()> {
         let worker_quarantine_dir = quarantine_dir.clone();
         let worker_ingest_ts = run_ingest_ts.clone();
         let worker_jpeg_quality = config.jpeg_quality;
+        let worker_hash_downscale_size = config.hash_downscale_size;
 
         workers_join.push(thread::spawn(move || {
             let hasher = HasherConfig::new().hash_alg(HashAlg::Mean).to_hasher();
@@ -500,12 +518,89 @@ fn main() -> Result<()> {
                             ),
                         },
                     },
+                    DetectedFormat::Jpeg => {
+                        match fs::read(&path) {
+                            Ok(jpeg_bytes) => match turbojpeg::decompress_to_yuv(&jpeg_bytes) {
+                                Ok(yuv) => {
+                                    let width = yuv.width;
+                                    let height = yuv.height;
+                                    let y_stride = yuv.y_width();
+                                    let mut grayscale = vec![0u8; width * height];
+
+                                    for row in 0..height {
+                                        let src_start = row * y_stride;
+                                        let src_end = src_start + width;
+                                        let dst_start = row * width;
+                                        grayscale[dst_start..dst_start + width]
+                                            .copy_from_slice(&yuv.pixels[src_start..src_end]);
+                                    }
+
+                                    let gray_image = GrayImage::from_raw(
+                                        width as u32,
+                                        height as u32,
+                                        grayscale,
+                                    )
+                                    .expect("grayscale buffer should match image dimensions");
+                                    let downscaled = image::imageops::resize(
+                                        &gray_image,
+                                        worker_hash_downscale_size,
+                                        worker_hash_downscale_size,
+                                        FilterType::Triangle,
+                                    );
+                                    let hash = hasher.hash_image(&DynamicImage::ImageLuma8(downscaled)).to_base64();
+                                    let stored_path = original_path.clone();
+
+                                    ProcessResult::Hashed {
+                                        hash,
+                                        original_path,
+                                        stored_path,
+                                        detected_format: detected.as_str().to_string(),
+                                        original_extension,
+                                        action_taken: "kept_jpeg".to_string(),
+                                        quarantine_path: None,
+                                        transcode_path: None,
+                                        ingest_ts: worker_ingest_ts.clone(),
+                                    }
+                                }
+                                Err(e) => match if dry_run {
+                                    let ext = path
+                                        .extension()
+                                        .and_then(|x| x.to_str())
+                                        .unwrap_or("bin")
+                                        .to_lowercase();
+                                    Ok(unique_target_path(&worker_quarantine_dir, &path, &ext))
+                                } else {
+                                    quarantine_file(&path, &worker_quarantine_dir)
+                                } {
+                                    Ok(quarantined) => ProcessResult::Quarantined {
+                                        path: original_path,
+                                        detected_format: detected.as_str().to_string(),
+                                        message: if dry_run {
+                                            format!("would quarantine jpeg decode failure: {}", e)
+                                        } else {
+                                            format!("jpeg decode failed: {}", e)
+                                        },
+                                        quarantine_path: quarantined.to_string_lossy().to_string(),
+                                    },
+                                    Err(move_err) => ProcessResult::Error {
+                                        path: original_path,
+                                        message: format!(
+                                            "jpeg decode failed: {}; quarantine move failed: {}",
+                                            e, move_err
+                                        ),
+                                    },
+                                },
+                            },
+                            Err(e) => ProcessResult::Error {
+                                path: original_path,
+                                message: format!("failed to read jpeg bytes: {}", e),
+                            },
+                        }
+                    }
                     _ => match image::open(&path) {
                         Ok(img) => {
                             let (stored_path, action_taken, transcode_path) =
-                                if matches!(detected, DetectedFormat::Jpeg) {
-                                    (original_path.clone(), "kept_jpeg".to_string(), None)
-                                } else if detected.is_transcode_candidate() {
+                                if detected.is_transcode_candidate() {
                                     match if dry_run {
                                         Ok(unique_target_path(&worker_transcode_dir, &path, "jpg"))
                                     } else {
@@ -686,7 +781,7 @@ fn main() -> Result<()> {
                 };
 
                 eprintln!(
-                    "HEARTBEAT elapsed={} discovered={} processed={} errors={} transcodes={} quarantined={} avg_rate={:.2}/s inst_rate={:.2}/s scan_done={} pct={:.1}% eta={} q_path={} q_result={}",
+                    "HEARTBEAT elapsed={} discovered={} processed={} errors={} transcodes={} quarantined={} avg_rate={:.2}/s inst_rate={:.2}/s scan_done={} pct={:.1}% eta={} hash_downscale={} q_path={} q_result={}",
                     format_duration(start.elapsed().as_secs()),
                     discovered,
                     processed_total,
@@ -698,6 +793,7 @@ fn main() -> Result<()> {
                     scan_done,
                     pct,
                     eta,
+                    config.hash_downscale_size,
                     path_rx.len(),
                     result_rx.len()
                 );
@@ -859,7 +955,7 @@ fn main() -> Result<()> {
                     };
 
                     eprintln!(
-                        "HEARTBEAT elapsed={} discovered={} processed={} errors={} transcodes={} quarantined={} avg_rate={:.2}/s inst_rate={:.2}/s scan_done={} pct={:.1}% eta={} q_path={} q_result={}",
+                        "HEARTBEAT elapsed={} discovered={} processed={} errors={} transcodes={} quarantined={} avg_rate={:.2}/s inst_rate={:.2}/s scan_done={} pct={:.1}% eta={} hash_downscale={} q_path={} q_result={}",
                         format_duration(start.elapsed().as_secs()),
                         discovered,
                         processed_total,
@@ -871,6 +967,7 @@ fn main() -> Result<()> {
                         scan_done,
                         pct,
                         eta,
+                        config.hash_downscale_size,
                         path_rx.len(),
                         result_rx.len()
                     );

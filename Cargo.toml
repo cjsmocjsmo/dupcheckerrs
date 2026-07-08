@@ -11,3 +11,4 @@ image = { version = "0.23", features = ["jpeg"] }
 time = "0.3"
 indicatif = "0.17"
 crossbeam-channel = "0.5"
+turbojpeg = "1.4"
