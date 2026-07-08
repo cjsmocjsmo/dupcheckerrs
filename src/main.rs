@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 use turbojpeg;
 
 // Set all runtime behavior here, then build on rpi4 and copy only the binary to rpi3b+.
-const DUPCHECKER_DRY_RUN: bool = true;
+const DUPCHECKER_DRY_RUN: bool = false;
 const DUPCHECKER_WORKERS: usize = 3;
 const DUPCHECKER_HEARTBEAT_SECS: u64 = 15;
 const DUPCHECKER_STALL_WARN_SECS: u64 = 120;
@@ -32,7 +32,7 @@ const DUPCHECKER_MAX_CONSOLE_ERRORS: u64 = 20;
 const DUPCHECKER_PATH_QUEUE_CAP: usize = 2048;
 const DUPCHECKER_RESULT_QUEUE_CAP: usize = 2048;
 const DUPCHECKER_JPEG_QUALITY: u8 = 95;
-const DUPCHECKER_HASH_DOWNSCALE_SIZE: u32 = 64;
+const DUPCHECKER_HASH_DOWNSCALE_SIZE: u32 = 124;
 
 // Optional compatibility mode: when true, environment variables can override the constants above.
 const ENABLE_ENV_OVERRIDES: bool = false;
