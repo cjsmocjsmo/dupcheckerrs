@@ -40,7 +40,7 @@ const DEFAULT_PATH_QUEUE_CAP: usize = 2048;
 const DEFAULT_RESULT_QUEUE_CAP: usize = 2048;
 const DEFAULT_HEARTBEAT_SECS: u64 = 15;
 const DEFAULT_STALL_WARN_SECS: u64 = 120;
-const DEFAULT_WORKERS: usize = 3;
+const DEFAULT_WORKERS: usize = 1;
 const DEFAULT_JPEG_QUALITY: u8 = 95;
 
 struct RuntimeConfig {
