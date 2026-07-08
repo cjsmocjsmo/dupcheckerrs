@@ -17,35 +17,40 @@ use std::{env, fs, io};
 use time::OffsetDateTime;
 use turbojpeg;
 
-const ENV_DRY_RUN: &str = "DUPCHECKERRS_DRY_RUN";
-const ENV_WORKERS: &str = "DUPCHECKERRS_WORKERS";
-const ENV_HEARTBEAT_SECS: &str = "DUPCHECKERRS_HEARTBEAT_SECS";
-const ENV_STALL_WARN_SECS: &str = "DUPCHECKERRS_STALL_WARN_SECS";
-const ENV_NO_PROGRESS: &str = "DUPCHECKERRS_NO_PROGRESS";
-const ENV_DB_PATH: &str = "DUPCHECKERRS_DB_PATH";
-const ENV_SEARCH_DIR: &str = "DUPCHECKERRS_SEARCH_DIR";
-const ENV_ERROR_LOG_FILE: &str = "DUPCHECKERRS_ERROR_LOG_FILE";
-const ENV_TRANSCODE_DIR_NAME: &str = "DUPCHECKERRS_TRANSCODE_DIR_NAME";
-const ENV_QUARANTINE_DIR_NAME: &str = "DUPCHECKERRS_QUARANTINE_DIR_NAME";
-const ENV_MAX_CONSOLE_ERRORS: &str = "DUPCHECKERRS_MAX_CONSOLE_ERRORS";
-const ENV_PATH_QUEUE_CAP: &str = "DUPCHECKERRS_PATH_QUEUE_CAP";
-const ENV_RESULT_QUEUE_CAP: &str = "DUPCHECKERRS_RESULT_QUEUE_CAP";
-const ENV_JPEG_QUALITY: &str = "DUPCHECKERRS_JPEG_QUALITY";
-const ENV_HASH_DOWNSCALE_SIZE: &str = "DUPCHECKERRS_HASH_DOWNSCALE_SIZE";
+// Set all runtime behavior here, then build on rpi4 and copy only the binary to rpi3b+.
+const DUPCHECKER_DRY_RUN: bool = true;
+const DUPCHECKER_WORKERS: usize = 3;
+const DUPCHECKER_HEARTBEAT_SECS: u64 = 15;
+const DUPCHECKER_STALL_WARN_SECS: u64 = 120;
+const DUPCHECKER_PROGRESS_ENABLED: bool = true;
+const DUPCHECKER_DB_PATH: &str = "/media/PiTB/images.db";
+const DUPCHECKER_SEARCH_DIR: &str = "/media/PiTB/foofuck";
+const DUPCHECKER_ERROR_LOG_FILE: &str = "dupcheckerrs-errors.log";
+const DUPCHECKER_TRANSCODE_DIR_NAME: &str = "transcoded_jpg";
+const DUPCHECKER_QUARANTINE_DIR_NAME: &str = "quarantine";
+const DUPCHECKER_MAX_CONSOLE_ERRORS: u64 = 20;
+const DUPCHECKER_PATH_QUEUE_CAP: usize = 2048;
+const DUPCHECKER_RESULT_QUEUE_CAP: usize = 2048;
+const DUPCHECKER_JPEG_QUALITY: u8 = 95;
+const DUPCHECKER_HASH_DOWNSCALE_SIZE: u32 = 64;
 
-const DEFAULT_DB_PATH: &str = "/media/PiTB/images.db";
-const DEFAULT_SEARCH_DIR: &str = "/media/PiTB/foofuck/Camera1";
-const DEFAULT_ERROR_LOG_FILE: &str = "dupcheckerrs-errors.log";
-const DEFAULT_TRANSCODE_DIR_NAME: &str = "transcoded_jpg";
-const DEFAULT_QUARANTINE_DIR_NAME: &str = "quarantine";
-const DEFAULT_MAX_CONSOLE_ERRORS: u64 = 20;
-const DEFAULT_PATH_QUEUE_CAP: usize = 2048;
-const DEFAULT_RESULT_QUEUE_CAP: usize = 2048;
-const DEFAULT_HEARTBEAT_SECS: u64 = 15;
-const DEFAULT_STALL_WARN_SECS: u64 = 120;
-const DEFAULT_WORKERS: usize = 3;
-const DEFAULT_JPEG_QUALITY: u8 = 95;
-const DEFAULT_HASH_DOWNSCALE_SIZE: u32 = 64;
+// Optional compatibility mode: when true, environment variables can override the constants above.
+const ENABLE_ENV_OVERRIDES: bool = false;
+const ENV_DRY_RUN: &str = "DUPCHECKER_DRY_RUN";
+const ENV_WORKERS: &str = "DUPCHECKER_WORKERS";
+const ENV_HEARTBEAT_SECS: &str = "DUPCHECKER_HEARTBEAT_SECS";
+const ENV_STALL_WARN_SECS: &str = "DUPCHECKER_STALL_WARN_SECS";
+const ENV_PROGRESS_ENABLED: &str = "DUPCHECKER_PROGRESS_ENABLED";
+const ENV_DB_PATH: &str = "DUPCHECKER_DB_PATH";
+const ENV_SEARCH_DIR: &str = "DUPCHECKER_SEARCH_DIR";
+const ENV_ERROR_LOG_FILE: &str = "DUPCHECKER_ERROR_LOG_FILE";
+const ENV_TRANSCODE_DIR_NAME: &str = "DUPCHECKER_TRANSCODE_DIR_NAME";
+const ENV_QUARANTINE_DIR_NAME: &str = "DUPCHECKER_QUARANTINE_DIR_NAME";
+const ENV_MAX_CONSOLE_ERRORS: &str = "DUPCHECKER_MAX_CONSOLE_ERRORS";
+const ENV_PATH_QUEUE_CAP: &str = "DUPCHECKER_PATH_QUEUE_CAP";
+const ENV_RESULT_QUEUE_CAP: &str = "DUPCHECKER_RESULT_QUEUE_CAP";
+const ENV_JPEG_QUALITY: &str = "DUPCHECKER_JPEG_QUALITY";
+const ENV_HASH_DOWNSCALE_SIZE: &str = "DUPCHECKER_HASH_DOWNSCALE_SIZE";
 
 struct RuntimeConfig {
     dry_run: bool,
@@ -66,26 +71,46 @@ struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    fn from_env() -> Self {
-        let jpeg_quality = env_u8(ENV_JPEG_QUALITY, DEFAULT_JPEG_QUALITY).clamp(1, 100);
-        let hash_downscale_size = env_u32(ENV_HASH_DOWNSCALE_SIZE, DEFAULT_HASH_DOWNSCALE_SIZE)
-            .clamp(8, 512);
-        RuntimeConfig {
-            dry_run: env_flag(ENV_DRY_RUN),
-            workers: env_usize(ENV_WORKERS, DEFAULT_WORKERS),
-            heartbeat_secs: env_u64(ENV_HEARTBEAT_SECS, DEFAULT_HEARTBEAT_SECS),
-            stall_warn_secs: env_u64(ENV_STALL_WARN_SECS, DEFAULT_STALL_WARN_SECS),
-            progress_enabled: !env_flag(ENV_NO_PROGRESS),
-            db_path: env_string(ENV_DB_PATH, DEFAULT_DB_PATH),
-            search_dir: env_string(ENV_SEARCH_DIR, DEFAULT_SEARCH_DIR),
-            error_log_file: env_string(ENV_ERROR_LOG_FILE, DEFAULT_ERROR_LOG_FILE),
-            transcode_dir_name: env_string(ENV_TRANSCODE_DIR_NAME, DEFAULT_TRANSCODE_DIR_NAME),
-            quarantine_dir_name: env_string(ENV_QUARANTINE_DIR_NAME, DEFAULT_QUARANTINE_DIR_NAME),
-            max_console_errors: env_u64(ENV_MAX_CONSOLE_ERRORS, DEFAULT_MAX_CONSOLE_ERRORS),
-            path_queue_cap: env_usize(ENV_PATH_QUEUE_CAP, DEFAULT_PATH_QUEUE_CAP),
-            result_queue_cap: env_usize(ENV_RESULT_QUEUE_CAP, DEFAULT_RESULT_QUEUE_CAP),
-            jpeg_quality,
-            hash_downscale_size,
+    fn load() -> Self {
+        let base = RuntimeConfig {
+            dry_run: DUPCHECKER_DRY_RUN,
+            workers: DUPCHECKER_WORKERS,
+            heartbeat_secs: DUPCHECKER_HEARTBEAT_SECS,
+            stall_warn_secs: DUPCHECKER_STALL_WARN_SECS,
+            progress_enabled: DUPCHECKER_PROGRESS_ENABLED,
+            db_path: DUPCHECKER_DB_PATH.to_string(),
+            search_dir: DUPCHECKER_SEARCH_DIR.to_string(),
+            error_log_file: DUPCHECKER_ERROR_LOG_FILE.to_string(),
+            transcode_dir_name: DUPCHECKER_TRANSCODE_DIR_NAME.to_string(),
+            quarantine_dir_name: DUPCHECKER_QUARANTINE_DIR_NAME.to_string(),
+            max_console_errors: DUPCHECKER_MAX_CONSOLE_ERRORS,
+            path_queue_cap: DUPCHECKER_PATH_QUEUE_CAP,
+            result_queue_cap: DUPCHECKER_RESULT_QUEUE_CAP,
+            jpeg_quality: DUPCHECKER_JPEG_QUALITY.clamp(1, 100),
+            hash_downscale_size: DUPCHECKER_HASH_DOWNSCALE_SIZE.clamp(8, 512),
+        };
+
+        if ENABLE_ENV_OVERRIDES {
+            RuntimeConfig {
+                dry_run: env_flag(ENV_DRY_RUN) || base.dry_run,
+                workers: env_usize(ENV_WORKERS, base.workers),
+                heartbeat_secs: env_u64(ENV_HEARTBEAT_SECS, base.heartbeat_secs),
+                stall_warn_secs: env_u64(ENV_STALL_WARN_SECS, base.stall_warn_secs),
+                progress_enabled: env_flag(ENV_PROGRESS_ENABLED) || base.progress_enabled,
+                db_path: env_string(ENV_DB_PATH, &base.db_path),
+                search_dir: env_string(ENV_SEARCH_DIR, &base.search_dir),
+                error_log_file: env_string(ENV_ERROR_LOG_FILE, &base.error_log_file),
+                transcode_dir_name: env_string(ENV_TRANSCODE_DIR_NAME, &base.transcode_dir_name),
+                quarantine_dir_name: env_string(ENV_QUARANTINE_DIR_NAME, &base.quarantine_dir_name),
+                max_console_errors: env_u64(ENV_MAX_CONSOLE_ERRORS, base.max_console_errors),
+                path_queue_cap: env_usize(ENV_PATH_QUEUE_CAP, base.path_queue_cap),
+                result_queue_cap: env_usize(ENV_RESULT_QUEUE_CAP, base.result_queue_cap),
+                jpeg_quality: env_u8(ENV_JPEG_QUALITY, base.jpeg_quality).clamp(1, 100),
+                hash_downscale_size: env_u32(ENV_HASH_DOWNSCALE_SIZE, base.hash_downscale_size)
+                    .clamp(8, 512),
+            }
+        } else {
+            base
         }
     }
 }
@@ -323,7 +348,7 @@ fn format_duration(total_secs: u64) -> String {
 
 fn main() -> Result<()> {
     let start = Instant::now();
-    let config = RuntimeConfig::from_env();
+    let config = RuntimeConfig::load();
     let dry_run = config.dry_run;
     let cwd = env::current_dir().expect("failed to read current working directory");
     let transcode_dir = cwd.join(&config.transcode_dir_name);
@@ -332,8 +357,7 @@ fn main() -> Result<()> {
 
     if dry_run {
         println!(
-            "Dry run enabled ({}): previewing actions without DB writes, transcodes, or file moves",
-            ENV_DRY_RUN
+            "Dry run enabled (set by DUPCHECKER_DRY_RUN in source): previewing actions without DB writes, transcodes, or file moves"
         );
     }
 
@@ -361,11 +385,11 @@ fn main() -> Result<()> {
     let stall_warn_secs = config.stall_warn_secs;
     let progress_enabled = config.progress_enabled;
     println!(
-        "Using {} worker threads (override with {})",
-        workers, ENV_WORKERS
+        "Using {} worker threads (set by DUPCHECKER_WORKERS in source)",
+        workers
     );
     eprintln!(
-        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} queue_caps=({}, {}) max_console_errors={}",
+        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} queue_caps=({}, {}) max_console_errors={} env_overrides={}",
         config.search_dir,
         config.db_path,
         heartbeat_secs,
@@ -375,7 +399,8 @@ fn main() -> Result<()> {
         config.hash_downscale_size,
         config.path_queue_cap,
         config.result_queue_cap,
-        config.max_console_errors
+        config.max_console_errors,
+        ENABLE_ENV_OVERRIDES
     );
 
     // Open and initialize the database only when not in dry-run mode.
