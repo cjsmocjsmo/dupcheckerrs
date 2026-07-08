@@ -2,24 +2,27 @@ use rusqlite::{params, Connection, Result};
 use walkdir::WalkDir;
 use img_hash::image::{self, DynamicImage, ImageOutputFormat};
 use img_hash::{HashAlg, HasherConfig};
+use crossbeam_channel::bounded;
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 use std::{env, fs, io};
 use time::OffsetDateTime;
 
 const DB_PATH: &str = "/media/PiTB/images.db";
-const SEARCH_DIR: &str = "/media/PiTB/foofuck";
-const CHUNK_SIZE: usize = 4096;
+const SEARCH_DIR: &str = "/media/PiTB/foofuck/MASTERPICS";
 const ERROR_LOG_FILE: &str = "dupcheckerrs-errors.log";
 const TRANSCODE_DIR_NAME: &str = "transcoded_jpg";
 const QUARANTINE_DIR_NAME: &str = "quarantine";
 const MAX_CONSOLE_ERRORS: u64 = 20;
+const PATH_QUEUE_CAP: usize = 2048;
+const RESULT_QUEUE_CAP: usize = 2048;
 
 #[derive(Clone, Copy)]
 enum DetectedFormat {
@@ -104,6 +107,25 @@ fn detect_format(bytes: &[u8]) -> DetectedFormat {
     }
 }
 
+fn detect_format_from_path(path: &Path) -> DetectedFormat {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return DetectedFormat::Unknown,
+    };
+
+    let mut header = [0u8; 64];
+    let read = match file.read(&mut header) {
+        Ok(n) => n,
+        Err(_) => return DetectedFormat::Unknown,
+    };
+
+    if read == 0 {
+        DetectedFormat::Unknown
+    } else {
+        detect_format(&header[..read])
+    }
+}
+
 fn path_fingerprint(path: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
@@ -147,7 +169,7 @@ fn transcode_to_jpeg(img: &DynamicImage, source: &Path, transcode_dir: &Path) ->
     let out_path = unique_target_path(transcode_dir, source, "jpg");
     let file = fs::File::create(&out_path)?;
     let mut writer = BufWriter::new(file);
-    img.write_to(&mut writer, ImageOutputFormat::Jpeg(90))
+    img.write_to(&mut writer, ImageOutputFormat::Jpeg(95))
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("jpeg encode failed: {}", e)))?;
     writer.flush()?;
     Ok(out_path)
@@ -185,6 +207,14 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn worker_count() -> usize {
+    env::var("DUPCHECKERRS_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2)
+}
+
 fn main() -> Result<()> {
     let start = Instant::now();
     let dry_run = env_flag("DUPCHECKERRS_DRY_RUN");
@@ -218,10 +248,11 @@ fn main() -> Result<()> {
         }
     }
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(3)
-        .build_global()
-        .expect("failed to configure rayon thread pool");
+    let workers = worker_count();
+    println!(
+        "Using {} worker threads (override with DUPCHECKERRS_WORKERS)",
+        workers
+    );
 
     // Open and initialize the database only when not in dry-run mode.
     let mut conn = if dry_run {
@@ -253,30 +284,17 @@ fn main() -> Result<()> {
         Some(conn)
     };
 
-    // Keep extension-based discovery, then classify by magic bytes before decode.
-    let image_paths: Vec<_> = WalkDir::new(SEARCH_DIR)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|entry| {
-            entry.path().is_file() && {
-                let ext = extension_of(entry.path());
-                ext == "jpg" || ext == "jpeg"
-            }
-        })
-        .map(|entry| entry.path().to_owned())
-        .collect();
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {msg}")
+            .unwrap(),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
-    let pb = ProgressBar::new(image_paths.len() as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-        .unwrap()
-        .progress_chars("#>-"));
-
-    let error_count = AtomicU64::new(0);
-    let progress_count = AtomicU64::new(0);
-    let progress_step = 32u64;
-    let pb_worker = pb.clone();
     let mut total_inserted = 0u64;
+    let mut processed_total = 0u64;
+    let mut errors = 0u64;
     let mut console_errors_printed = 0u64;
     let mut console_errors_suppressed = 0u64;
 
@@ -299,77 +317,82 @@ fn main() -> Result<()> {
         }
     };
 
-    for chunk in image_paths.chunks(CHUNK_SIZE) {
-        // Build one hasher per worker thread and collect successful hashes without a global mutex.
-        let results: Vec<ProcessResult> = chunk
-            .par_iter()
-            .map_init(
-                || HasherConfig::new().hash_alg(HashAlg::Mean).to_hasher(),
-                |hasher, path| {
-                    let original_path = path.to_string_lossy().to_string();
-                    let original_extension = extension_of(path);
-                    let bytes = match fs::read(path) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            error_count.fetch_add(1, Ordering::Relaxed);
-                            let output = ProcessResult::Error {
-                                path: original_path,
-                                message: format!("failed to read file: {}", e),
-                            };
-                            let processed = progress_count.fetch_add(1, Ordering::Relaxed) + 1;
-                            if processed % progress_step == 0 {
-                                pb_worker.set_position(processed);
-                            }
-                            return output;
-                        }
-                    };
+    let run_ingest_ts = OffsetDateTime::now_utc().unix_timestamp().to_string();
+    let discovered_count = Arc::new(AtomicU64::new(0));
 
-                    let detected = detect_format(&bytes);
+    let (path_tx, path_rx) = bounded::<PathBuf>(PATH_QUEUE_CAP);
+    let (result_tx, result_rx) = bounded::<ProcessResult>(RESULT_QUEUE_CAP);
 
-                    let output = match detected {
-                        DetectedFormat::Unknown => match if dry_run {
-                            let ext = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("bin")
-                                .to_lowercase();
-                            Ok(unique_target_path(&quarantine_dir, path, &ext))
-                        } else {
-                            quarantine_file(path, &quarantine_dir)
-                        } {
-                            Ok(quarantined) => {
-                                error_count.fetch_add(1, Ordering::Relaxed);
-                                ProcessResult::Quarantined {
-                                    path: original_path,
-                                    detected_format: detected.as_str().to_string(),
-                                    message: if dry_run {
-                                        "would quarantine unknown file signature".to_string()
-                                    } else {
-                                        "unknown file signature".to_string()
-                                    },
-                                    quarantine_path: quarantined.to_string_lossy().to_string(),
-                                }
-                            }
-                            Err(e) => {
-                                error_count.fetch_add(1, Ordering::Relaxed);
-                                ProcessResult::Error {
-                                    path: original_path,
-                                    message: format!(
-                                        "unknown file signature and quarantine move failed: {}",
-                                        e
-                                    ),
-                                }
-                            }
+    let discover_counter = Arc::clone(&discovered_count);
+    let scanner = thread::spawn(move || {
+        for entry in WalkDir::new(SEARCH_DIR).into_iter().filter_map(|e| e.ok()) {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let ext = extension_of(entry.path());
+            if ext == "jpg" || ext == "jpeg" {
+                discover_counter.fetch_add(1, Ordering::Relaxed);
+                if path_tx.send(entry.path().to_owned()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut workers_join = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let worker_rx = path_rx.clone();
+        let worker_tx = result_tx.clone();
+        let worker_transcode_dir = transcode_dir.clone();
+        let worker_quarantine_dir = quarantine_dir.clone();
+        let worker_ingest_ts = run_ingest_ts.clone();
+
+        workers_join.push(thread::spawn(move || {
+            let hasher = HasherConfig::new().hash_alg(HashAlg::Mean).to_hasher();
+            for path in worker_rx.iter() {
+                let original_path = path.to_string_lossy().to_string();
+                let original_extension = extension_of(&path);
+                let detected = detect_format_from_path(&path);
+
+                let output = match detected {
+                    DetectedFormat::Unknown => match if dry_run {
+                        let ext = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("bin")
+                            .to_lowercase();
+                        Ok(unique_target_path(&worker_quarantine_dir, &path, &ext))
+                    } else {
+                        quarantine_file(&path, &worker_quarantine_dir)
+                    } {
+                        Ok(quarantined) => ProcessResult::Quarantined {
+                            path: original_path,
+                            detected_format: detected.as_str().to_string(),
+                            message: if dry_run {
+                                "would quarantine unknown file signature".to_string()
+                            } else {
+                                "unknown file signature".to_string()
+                            },
+                            quarantine_path: quarantined.to_string_lossy().to_string(),
                         },
-                        _ => match image::load_from_memory(&bytes) {
-                            Ok(img) => {
-                                let (stored_path, action_taken, transcode_path) = if matches!(detected, DetectedFormat::Jpeg) {
+                        Err(e) => ProcessResult::Error {
+                            path: original_path,
+                            message: format!(
+                                "unknown file signature and quarantine move failed: {}",
+                                e
+                            ),
+                        },
+                    },
+                    _ => match image::open(&path) {
+                        Ok(img) => {
+                            let (stored_path, action_taken, transcode_path) =
+                                if matches!(detected, DetectedFormat::Jpeg) {
                                     (original_path.clone(), "kept_jpeg".to_string(), None)
                                 } else if detected.is_transcode_candidate() {
                                     match if dry_run {
-                                        Ok(unique_target_path(&transcode_dir, path, "jpg"))
+                                        Ok(unique_target_path(&worker_transcode_dir, &path, "jpg"))
                                     } else {
-                                        transcode_to_jpeg(&img, path, &transcode_dir)
+                                        transcode_to_jpeg(&img, &path, &worker_transcode_dir)
                                     } {
                                         Ok(p) => {
                                             let trans_path = p.to_string_lossy().to_string();
@@ -384,120 +407,148 @@ fn main() -> Result<()> {
                                             )
                                         }
                                         Err(e) => {
-                                            error_count.fetch_add(1, Ordering::Relaxed);
-                                            let output = ProcessResult::Error {
-                                                path: original_path,
-                                                message: format!("failed to transcode image: {}", e),
-                                            };
-                                            let processed = progress_count.fetch_add(1, Ordering::Relaxed) + 1;
-                                            if processed % progress_step == 0 {
-                                                pb_worker.set_position(processed);
+                                            if worker_tx
+                                                .send(ProcessResult::Error {
+                                                    path: original_path,
+                                                    message: format!(
+                                                        "failed to transcode image: {}",
+                                                        e
+                                                    ),
+                                                })
+                                                .is_err()
+                                            {
+                                                break;
                                             }
-                                            return output;
+                                            continue;
                                         }
                                     }
                                 } else {
                                     (original_path.clone(), "kept_jpeg".to_string(), None)
                                 };
 
-                                let hash = hasher.hash_image(&img).to_base64();
-                                ProcessResult::Hashed {
-                                    hash,
-                                    original_path,
-                                    stored_path,
-                                    detected_format: detected.as_str().to_string(),
-                                    original_extension,
-                                    action_taken,
-                                    quarantine_path: None,
-                                    transcode_path,
-                                    ingest_ts: OffsetDateTime::now_utc().unix_timestamp().to_string(),
-                                }
+                            let hash = hasher.hash_image(&img).to_base64();
+                            ProcessResult::Hashed {
+                                hash,
+                                original_path,
+                                stored_path,
+                                detected_format: detected.as_str().to_string(),
+                                original_extension,
+                                action_taken,
+                                quarantine_path: None,
+                                transcode_path,
+                                ingest_ts: worker_ingest_ts.clone(),
                             }
-                            Err(e) => match if dry_run {
-                                let ext = path
-                                    .extension()
-                                    .and_then(|x| x.to_str())
-                                    .unwrap_or("bin")
-                                    .to_lowercase();
-                                Ok(unique_target_path(&quarantine_dir, path, &ext))
-                            } else {
-                                quarantine_file(path, &quarantine_dir)
-                            } {
-                                Ok(quarantined) => {
-                                    error_count.fetch_add(1, Ordering::Relaxed);
-                                    ProcessResult::Quarantined {
-                                        path: original_path,
-                                        detected_format: detected.as_str().to_string(),
-                                        message: if dry_run {
-                                            format!("would quarantine decode failure (truncated/corrupt): {}", e)
-                                        } else {
-                                            format!("decode failed (truncated/corrupt): {}", e)
-                                        },
-                                        quarantine_path: quarantined.to_string_lossy().to_string(),
-                                    }
-                                }
-                                Err(move_err) => {
-                                    error_count.fetch_add(1, Ordering::Relaxed);
-                                    ProcessResult::Error {
-                                        path: original_path,
-                                        message: format!(
-                                            "decode failed (truncated/corrupt): {}; quarantine move failed: {}",
-                                            e, move_err
-                                        ),
-                                    }
-                                }
+                        }
+                        Err(e) => match if dry_run {
+                            let ext = path
+                                .extension()
+                                .and_then(|x| x.to_str())
+                                .unwrap_or("bin")
+                                .to_lowercase();
+                            Ok(unique_target_path(&worker_quarantine_dir, &path, &ext))
+                        } else {
+                            quarantine_file(&path, &worker_quarantine_dir)
+                        } {
+                            Ok(quarantined) => ProcessResult::Quarantined {
+                                path: original_path,
+                                detected_format: detected.as_str().to_string(),
+                                message: if dry_run {
+                                    format!("would quarantine decode failure (truncated/corrupt): {}", e)
+                                } else {
+                                    format!("decode failed (truncated/corrupt): {}", e)
+                                },
+                                quarantine_path: quarantined.to_string_lossy().to_string(),
                             },
-                        }
-                    };
+                            Err(move_err) => ProcessResult::Error {
+                                path: original_path,
+                                message: format!(
+                                    "decode failed (truncated/corrupt): {}; quarantine move failed: {}",
+                                    e, move_err
+                                ),
+                            },
+                        },
+                    },
+                };
 
-                    let processed = progress_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if processed % progress_step == 0 {
-                        pb_worker.set_position(processed);
-                    }
-                    output
-                },
-            )
-            .collect();
+                if worker_tx.send(output).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
 
-        if dry_run {
-            for result in results {
-                match result {
-                    ProcessResult::Hashed { action_taken, .. } => {
-                        if action_taken == "would_transcode_to_jpeg" {
-                            transcoded_total += 1;
-                        }
-                        total_inserted += 1;
+    drop(path_rx);
+    drop(result_tx);
+
+    if dry_run {
+        for result in result_rx.iter() {
+            processed_total += 1;
+            match result {
+                ProcessResult::Hashed { action_taken, .. } => {
+                    if action_taken == "would_transcode_to_jpeg" {
+                        transcoded_total += 1;
                     }
-                    ProcessResult::Quarantined { path, detected_format, message, quarantine_path } => {
-                        quarantined_total += 1;
-                        if console_errors_printed < MAX_CONSOLE_ERRORS {
-                            eprintln!(
-                                "Dry run: {} (detected={}, reason={}, target={})",
-                                path, detected_format, message, quarantine_path
-                            );
-                            console_errors_printed += 1;
-                        } else {
-                            console_errors_suppressed += 1;
-                        }
+                    total_inserted += 1;
+                }
+                ProcessResult::Quarantined {
+                    path,
+                    detected_format,
+                    message,
+                    quarantine_path,
+                } => {
+                    errors += 1;
+                    quarantined_total += 1;
+                    if console_errors_printed < MAX_CONSOLE_ERRORS {
+                        eprintln!(
+                            "Dry run: {} (detected={}, reason={}, target={})",
+                            path, detected_format, message, quarantine_path
+                        );
+                        console_errors_printed += 1;
+                    } else {
+                        console_errors_suppressed += 1;
                     }
-                    ProcessResult::Error { path, message } => {
-                        if console_errors_printed < MAX_CONSOLE_ERRORS {
-                            eprintln!("Dry run error: {} (reason: {})", path, message);
-                            console_errors_printed += 1;
-                        } else {
-                            console_errors_suppressed += 1;
-                        }
+                }
+                ProcessResult::Error { path, message } => {
+                    errors += 1;
+                    if console_errors_printed < MAX_CONSOLE_ERRORS {
+                        eprintln!("Dry run error: {} (reason: {})", path, message);
+                        console_errors_printed += 1;
+                    } else {
+                        console_errors_suppressed += 1;
                     }
                 }
             }
-        } else {
-            let tx = conn
-                .as_mut()
-                .expect("database connection should exist when not in dry-run")
-                .transaction()?;
-            {
-                let mut insert_hash_stmt = tx.prepare_cached(
-                    "INSERT OR IGNORE INTO hashes (
+
+            if processed_total % 128 == 0 {
+                let discovered = discovered_count.load(Ordering::Relaxed);
+                pb.set_message(format!("discovered={} processed={}", discovered, processed_total));
+            }
+        }
+    } else {
+        let tx = conn
+            .as_mut()
+            .expect("database connection should exist when not in dry-run")
+            .transaction()?;
+        {
+            let mut insert_hash_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO hashes (
+                    hash,
+                    original_path,
+                    stored_path,
+                    detected_format,
+                    original_extension,
+                    action_taken,
+                    quarantine_path,
+                    transcode_path,
+                    ingest_ts
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+
+            for result in result_rx.iter() {
+                processed_total += 1;
+                match result {
+                    ProcessResult::Hashed {
                         hash,
                         original_path,
                         stored_path,
@@ -506,14 +557,13 @@ fn main() -> Result<()> {
                         action_taken,
                         quarantine_path,
                         transcode_path,
-                        ingest_ts
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )?;
+                        ingest_ts,
+                    } => {
+                        if action_taken == "transcoded_to_jpeg" {
+                            transcoded_total += 1;
+                        }
 
-                for result in results {
-                    match result {
-                        ProcessResult::Hashed {
+                        let inserted = insert_hash_stmt.execute(params![
                             hash,
                             original_path,
                             stored_path,
@@ -522,78 +572,79 @@ fn main() -> Result<()> {
                             action_taken,
                             quarantine_path,
                             transcode_path,
-                            ingest_ts,
-                        } => {
-                            if action_taken == "transcoded_to_jpeg" {
-                                transcoded_total += 1;
-                            }
-
-                            let inserted = insert_hash_stmt.execute(params![
-                                hash,
-                                original_path,
-                                stored_path,
-                                detected_format,
-                                original_extension,
-                                action_taken,
-                                quarantine_path,
-                                transcode_path,
-                                ingest_ts
-                            ])?;
-                            if inserted > 0 {
-                                total_inserted += 1;
-                            }
+                            ingest_ts
+                        ])?;
+                        if inserted > 0 {
+                            total_inserted += 1;
                         }
-                        ProcessResult::Quarantined { path, detected_format, message, quarantine_path } => {
-                            quarantined_total += 1;
-                            if console_errors_printed < MAX_CONSOLE_ERRORS {
-                                eprintln!(
-                                    "Quarantined file: {} (detected={}, reason={}, quarantine={})",
-                                    path, detected_format, message, quarantine_path
-                                );
-                                console_errors_printed += 1;
-                            } else {
-                                console_errors_suppressed += 1;
-                            }
-
-                            if let Some(writer) = error_log_writer.as_mut() {
-                                let _ = writeln!(
-                                    writer,
-                                    "path={}\tdetected={}\taction=quarantined\treason={}\tquarantine_path={}",
-                                    path, detected_format, message, quarantine_path
-                                );
-                            }
+                    }
+                    ProcessResult::Quarantined {
+                        path,
+                        detected_format,
+                        message,
+                        quarantine_path,
+                    } => {
+                        errors += 1;
+                        quarantined_total += 1;
+                        if console_errors_printed < MAX_CONSOLE_ERRORS {
+                            eprintln!(
+                                "Quarantined file: {} (detected={}, reason={}, quarantine={})",
+                                path, detected_format, message, quarantine_path
+                            );
+                            console_errors_printed += 1;
+                        } else {
+                            console_errors_suppressed += 1;
                         }
-                        ProcessResult::Error { path, message } => {
-                            if console_errors_printed < MAX_CONSOLE_ERRORS {
-                                eprintln!("Could not open image: {} (reason: {})", path, message);
-                                console_errors_printed += 1;
-                            } else {
-                                console_errors_suppressed += 1;
-                            }
 
-                            if let Some(writer) = error_log_writer.as_mut() {
-                                let _ = writeln!(
-                                    writer,
-                                    "path={}\taction=error\treason={}",
-                                    path, message
-                                );
-                            }
+                        if let Some(writer) = error_log_writer.as_mut() {
+                            let _ = writeln!(
+                                writer,
+                                "path={}\tdetected={}\taction=quarantined\treason={}\tquarantine_path={}",
+                                path, detected_format, message, quarantine_path
+                            );
+                        }
+                    }
+                    ProcessResult::Error { path, message } => {
+                        errors += 1;
+                        if console_errors_printed < MAX_CONSOLE_ERRORS {
+                            eprintln!("Could not open image: {} (reason: {})", path, message);
+                            console_errors_printed += 1;
+                        } else {
+                            console_errors_suppressed += 1;
+                        }
+
+                        if let Some(writer) = error_log_writer.as_mut() {
+                            let _ = writeln!(writer, "path={}\taction=error\treason={}", path, message);
                         }
                     }
                 }
+
+                if processed_total % 128 == 0 {
+                    let discovered = discovered_count.load(Ordering::Relaxed);
+                    pb.set_message(format!("discovered={} processed={}", discovered, processed_total));
+                }
             }
-            tx.commit()?;
+        }
+        tx.commit()?;
+    }
+
+    if scanner.join().is_err() {
+        eprintln!("Warning: scanner thread terminated unexpectedly");
+    }
+    for worker in workers_join {
+        if worker.join().is_err() {
+            eprintln!("Warning: worker thread terminated unexpectedly");
         }
     }
 
-    pb.set_position(image_paths.len() as u64);
+    let total_discovered = discovered_count.load(Ordering::Relaxed);
+    pb.set_message(format!("discovered={} processed={}", total_discovered, processed_total));
     pb.finish_with_message("Processing done");
 
     let elapsed = start.elapsed();
-    let total = image_paths.len();
-    let errors = error_count.load(Ordering::Relaxed);
     println!("Done. Elapsed time: {:.2?}", elapsed);
-    println!("Total images processed: {}", total);
+    println!("Total images discovered: {}", total_discovered);
+    println!("Total images processed: {}", processed_total);
     println!("Total errors: {}", errors);
     println!("Total transcoded to JPG: {}", transcoded_total);
     println!("Total quarantined: {}", quarantined_total);
