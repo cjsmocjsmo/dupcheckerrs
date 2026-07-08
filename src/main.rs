@@ -31,7 +31,7 @@ const ENV_RESULT_QUEUE_CAP: &str = "DUPCHECKERRS_RESULT_QUEUE_CAP";
 const ENV_JPEG_QUALITY: &str = "DUPCHECKERRS_JPEG_QUALITY";
 
 const DEFAULT_DB_PATH: &str = "/media/PiTB/images.db";
-const DEFAULT_SEARCH_DIR: &str = "/media/PiTB/foofuck/MASTERPICS";
+const DEFAULT_SEARCH_DIR: &str = "/media/PiTB/foofuck/Camera1";
 const DEFAULT_ERROR_LOG_FILE: &str = "dupcheckerrs-errors.log";
 const DEFAULT_TRANSCODE_DIR_NAME: &str = "transcoded_jpg";
 const DEFAULT_QUARANTINE_DIR_NAME: &str = "quarantine";
