@@ -8,7 +8,7 @@ const DUPCHECKER_HEARTBEAT_SECS: u64 = 15;
 const DUPCHECKER_STALL_WARN_SECS: u64 = 120;
 const DUPCHECKER_PROGRESS_ENABLED: bool = true;
 const DUPCHECKER_DB_PATH: &str = "/media/PiTB/images.db";
-const DUPCHECKER_SEARCH_DIR: &str = "/media/PiTB/foofuck";
+const DUPCHECKER_SEARCH_DIR: &str = "/media/PiTB/foofuck/CameraT";
 const DUPCHECKER_ERROR_LOG_FILE: &str = "dupcheckerrs-errors.log";
 const DUPCHECKER_TRANSCODE_DIR_NAME: &str = "transcoded_jpg";
 const DUPCHECKER_QUARANTINE_DIR_NAME: &str = "quarantine";
@@ -21,8 +21,8 @@ const DUPCHECKER_MOVIE_WORKERS: usize = 1;
 const DUPCHECKER_MOVIE_FRAME_SAMPLES: usize = 5;
 const DUPCHECKER_MOVIE_PATH_QUEUE_CAP: usize = 512;
 const DUPCHECKER_MOVIE_RESULT_QUEUE_CAP: usize = 512;
-const DUPCHECKER_MASTER_IMAGE_DIR: &str = "";
-const DUPCHECKER_MASTER_MOVIE_DIR: &str = "";
+const DUPCHECKER_MASTER_IMAGE_DIR: &str = "/media/PiTB/RustMasterPics";
+const DUPCHECKER_MASTER_MOVIE_DIR: &str = "/media/PiTB/RustMasterMovies";
 
 // Optional compatibility mode: when true, environment variables can override the constants above.
 const ENABLE_ENV_OVERRIDES: bool = false;
