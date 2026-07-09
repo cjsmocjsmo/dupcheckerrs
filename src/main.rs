@@ -14,6 +14,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs, io};
+use ffmpeg_light::generate_thumbnail;
+use ffmpeg_light::probe;
+use ffmpeg_light::thumbnail::{ThumbnailFormat, ThumbnailOptions};
+use ffmpeg_light::types::Time;
 use time::OffsetDateTime;
 use turbojpeg;
 
@@ -24,7 +28,7 @@ const DUPCHECKER_HEARTBEAT_SECS: u64 = 15;
 const DUPCHECKER_STALL_WARN_SECS: u64 = 120;
 const DUPCHECKER_PROGRESS_ENABLED: bool = true;
 const DUPCHECKER_DB_PATH: &str = "/media/PiTB/images.db";
-const DUPCHECKER_SEARCH_DIR: &str = "/media/PiTB/foofuck";
+const DUPCHECKER_SEARCH_DIR: &str = "/media/PiTB/foofuck/CameraT";
 const DUPCHECKER_ERROR_LOG_FILE: &str = "dupcheckerrs-errors.log";
 const DUPCHECKER_TRANSCODE_DIR_NAME: &str = "transcoded_jpg";
 const DUPCHECKER_QUARANTINE_DIR_NAME: &str = "quarantine";
@@ -33,6 +37,10 @@ const DUPCHECKER_PATH_QUEUE_CAP: usize = 2048;
 const DUPCHECKER_RESULT_QUEUE_CAP: usize = 2048;
 const DUPCHECKER_JPEG_QUALITY: u8 = 95;
 const DUPCHECKER_HASH_DOWNSCALE_SIZE: u32 = 124;
+const DUPCHECKER_MOVIE_WORKERS: usize = 1;
+const DUPCHECKER_MOVIE_FRAME_SAMPLES: usize = 5;
+const DUPCHECKER_MOVIE_PATH_QUEUE_CAP: usize = 512;
+const DUPCHECKER_MOVIE_RESULT_QUEUE_CAP: usize = 512;
 
 // Optional compatibility mode: when true, environment variables can override the constants above.
 const ENABLE_ENV_OVERRIDES: bool = false;
@@ -68,6 +76,10 @@ struct RuntimeConfig {
     result_queue_cap: usize,
     jpeg_quality: u8,
     hash_downscale_size: u32,
+    movie_workers: usize,
+    movie_frame_samples: usize,
+    movie_path_queue_cap: usize,
+    movie_result_queue_cap: usize,
 }
 
 impl RuntimeConfig {
@@ -88,6 +100,10 @@ impl RuntimeConfig {
             result_queue_cap: DUPCHECKER_RESULT_QUEUE_CAP,
             jpeg_quality: DUPCHECKER_JPEG_QUALITY.clamp(1, 100),
             hash_downscale_size: DUPCHECKER_HASH_DOWNSCALE_SIZE.clamp(8, 512),
+            movie_workers: DUPCHECKER_MOVIE_WORKERS.max(1),
+            movie_frame_samples: DUPCHECKER_MOVIE_FRAME_SAMPLES.max(1),
+            movie_path_queue_cap: DUPCHECKER_MOVIE_PATH_QUEUE_CAP.max(1),
+            movie_result_queue_cap: DUPCHECKER_MOVIE_RESULT_QUEUE_CAP.max(1),
         };
 
         if ENABLE_ENV_OVERRIDES {
@@ -108,6 +124,10 @@ impl RuntimeConfig {
                 jpeg_quality: env_u8(ENV_JPEG_QUALITY, base.jpeg_quality).clamp(1, 100),
                 hash_downscale_size: env_u32(ENV_HASH_DOWNSCALE_SIZE, base.hash_downscale_size)
                     .clamp(8, 512),
+                movie_workers: base.movie_workers,
+                movie_frame_samples: base.movie_frame_samples,
+                movie_path_queue_cap: base.movie_path_queue_cap,
+                movie_result_queue_cap: base.movie_result_queue_cap,
             }
         } else {
             base
@@ -178,6 +198,49 @@ enum ProcessResult {
     },
 }
 
+#[derive(Clone, Copy)]
+enum DetectedVideoFormat {
+    Mp4,
+    Mov,
+    M4v,
+    Mkv,
+    Webm,
+    Avi,
+    Mpg,
+    Mpeg,
+    Unknown,
+}
+
+impl DetectedVideoFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            DetectedVideoFormat::Mp4 => "mp4",
+            DetectedVideoFormat::Mov => "mov",
+            DetectedVideoFormat::M4v => "m4v",
+            DetectedVideoFormat::Mkv => "mkv",
+            DetectedVideoFormat::Webm => "webm",
+            DetectedVideoFormat::Avi => "avi",
+            DetectedVideoFormat::Mpg => "mpg",
+            DetectedVideoFormat::Mpeg => "mpeg",
+            DetectedVideoFormat::Unknown => "unknown",
+        }
+    }
+}
+
+enum MovieProcessResult {
+    Hashed {
+        hash: String,
+        original_path: String,
+        detected_format: String,
+        extension: String,
+        ingest_ts: String,
+    },
+    Error {
+        path: String,
+        message: String,
+    },
+}
+
 fn extension_of(path: &Path) -> String {
     path.extension()
         .and_then(|e| e.to_str())
@@ -215,6 +278,164 @@ fn detect_format_from_path(path: &Path) -> DetectedFormat {
     } else {
         detect_format(&header[..read])
     }
+}
+
+fn is_image_extension(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp")
+}
+
+fn is_movie_extension(ext: &str) -> bool {
+    matches!(ext, "mp4" | "mov" | "m4v" | "mkv" | "webm" | "avi" | "mpg" | "mpeg")
+}
+
+fn detect_video_format_from_path(path: &Path) -> DetectedVideoFormat {
+    let ext = extension_of(path);
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return format_from_video_extension(&ext),
+    };
+
+    let mut header = [0u8; 64];
+    let read = match file.read(&mut header) {
+        Ok(n) => n,
+        Err(_) => 0,
+    };
+
+    if read >= 12 && &header[4..8] == b"ftyp" {
+        let brand = &header[8..12];
+        if brand == b"qt  " {
+            return DetectedVideoFormat::Mov;
+        }
+        if brand == b"M4V " {
+            return DetectedVideoFormat::M4v;
+        }
+        return DetectedVideoFormat::Mp4;
+    }
+
+    if read >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"AVI " {
+        return DetectedVideoFormat::Avi;
+    }
+
+    if read >= 4 && header[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return match ext.as_str() {
+            "webm" => DetectedVideoFormat::Webm,
+            "mkv" => DetectedVideoFormat::Mkv,
+            _ => DetectedVideoFormat::Unknown,
+        };
+    }
+
+    if read >= 4 && header[0..4] == [0x00, 0x00, 0x01, 0xBA] {
+        return match ext.as_str() {
+            "mpeg" => DetectedVideoFormat::Mpeg,
+            _ => DetectedVideoFormat::Mpg,
+        };
+    }
+
+    format_from_video_extension(&ext)
+}
+
+fn format_from_video_extension(ext: &str) -> DetectedVideoFormat {
+    match ext {
+        "mp4" => DetectedVideoFormat::Mp4,
+        "mov" => DetectedVideoFormat::Mov,
+        "m4v" => DetectedVideoFormat::M4v,
+        "mkv" => DetectedVideoFormat::Mkv,
+        "webm" => DetectedVideoFormat::Webm,
+        "avi" => DetectedVideoFormat::Avi,
+        "mpg" => DetectedVideoFormat::Mpg,
+        "mpeg" => DetectedVideoFormat::Mpeg,
+        _ => DetectedVideoFormat::Unknown,
+    }
+}
+
+fn hash_video_perceptual(
+    path: &Path,
+    hash_downscale_size: u32,
+    frame_samples: usize,
+) -> std::result::Result<String, String> {
+    let probe_result = probe(path).map_err(|e| format!("ffprobe failed: {}", e))?;
+    let duration = probe_result
+        .duration()
+        .ok_or_else(|| "video duration unavailable from ffprobe".to_string())?;
+
+    let duration_secs = duration.as_secs_f64();
+    if duration_secs <= 0.0 {
+        return Err("video duration is zero".to_string());
+    }
+
+    let target_size = hash_downscale_size.max(8);
+    let sample_target = frame_samples.max(1);
+    let hasher = HasherConfig::new().hash_alg(HashAlg::Mean).to_hasher();
+
+    let temp_root = env::temp_dir().join("dupcheckerrs-movie-frames");
+    fs::create_dir_all(&temp_root)
+        .map_err(|e| format!("failed to create movie temp dir {}: {}", temp_root.display(), e))?;
+
+    let source_id = path_fingerprint(path);
+    let unique_run = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let mut frame_hashes: Vec<String> = Vec::with_capacity(sample_target);
+
+    for idx in 0..sample_target {
+        let sample_ratio = (idx + 1) as f64 / (sample_target + 1) as f64;
+        let sample_secs = (duration_secs * sample_ratio).max(0.001);
+        let frame_time = Time::from_seconds_f64(sample_secs);
+
+        let frame_path = temp_root.join(format!(
+            "movie_{}_{}_{}_{}.jpg",
+            source_id,
+            unique_run,
+            std::process::id(),
+            idx
+        ));
+
+        let thumb_opts = ThumbnailOptions::new(frame_time)
+            .size(target_size, target_size)
+            .format(ThumbnailFormat::Jpeg);
+
+        if let Err(e) = generate_thumbnail(path, &frame_path, &thumb_opts) {
+            let _ = fs::remove_file(&frame_path);
+            return Err(format!(
+                "ffmpeg thumbnail generation failed at {:.3}s: {}",
+                sample_secs, e
+            ));
+        }
+
+        let frame_hash = match image::open(&frame_path) {
+            Ok(img) => {
+                let gray = image::imageops::resize(
+                    &img.to_luma8(),
+                    target_size,
+                    target_size,
+                    FilterType::Triangle,
+                );
+                hasher
+                    .hash_image(&DynamicImage::ImageLuma8(gray))
+                    .to_base64()
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&frame_path);
+                return Err(format!(
+                    "failed to open generated movie frame {}: {}",
+                    frame_path.display(),
+                    e
+                ));
+            }
+        };
+
+        let _ = fs::remove_file(&frame_path);
+        frame_hashes.push(frame_hash);
+    }
+
+    if frame_hashes.is_empty() {
+        return Err("no decodable video frames".to_string());
+    }
+
+    let mut aggregate = DefaultHasher::new();
+    for frame_hash in frame_hashes {
+        frame_hash.hash(&mut aggregate);
+    }
+    Ok(format!("{:016x}", aggregate.finish()))
 }
 
 fn path_fingerprint(path: &Path) -> u64 {
@@ -389,7 +610,7 @@ fn main() -> Result<()> {
         workers
     );
     eprintln!(
-        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} queue_caps=({}, {}) max_console_errors={} env_overrides={}",
+        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} image_queue_caps=({}, {}) movie_workers={} movie_frame_samples={} movie_queue_caps=({}, {}) max_console_errors={} env_overrides={}",
         config.search_dir,
         config.db_path,
         heartbeat_secs,
@@ -399,6 +620,10 @@ fn main() -> Result<()> {
         config.hash_downscale_size,
         config.path_queue_cap,
         config.result_queue_cap,
+        config.movie_workers,
+        config.movie_frame_samples,
+        config.movie_path_queue_cap,
+        config.movie_result_queue_cap,
         config.max_console_errors,
         ENABLE_ENV_OVERRIDES
     );
@@ -419,6 +644,18 @@ fn main() -> Result<()> {
                 action_taken TEXT NOT NULL,
                 quarantine_path TEXT,
                 transcode_path TEXT,
+                ingest_ts TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS movie_hashes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hash TEXT UNIQUE,
+                original_path TEXT NOT NULL,
+                detected_format TEXT NOT NULL,
+                extension TEXT NOT NULL,
                 ingest_ts TEXT NOT NULL
             )",
             [],
@@ -454,6 +691,8 @@ fn main() -> Result<()> {
 
     let mut quarantined_total = 0u64;
     let mut transcoded_total = 0u64;
+    let mut movie_processed_total = 0u64;
+    let mut movie_inserted_total = 0u64;
 
     let mut error_log_writer = if dry_run {
         None
@@ -487,7 +726,7 @@ fn main() -> Result<()> {
                 continue;
             }
             let ext = extension_of(entry.path());
-            if ext == "jpg" || ext == "jpeg" {
+            if is_image_extension(&ext) {
                 discover_counter.fetch_add(1, Ordering::Relaxed);
                 if path_tx.send(entry.path().to_owned()).is_err() {
                     break;
@@ -1039,17 +1278,184 @@ fn main() -> Result<()> {
     pb.set_message(format!("discovered={} processed={}", total_discovered, processed_total));
     pb.finish_with_message("Processing done");
 
+    println!("Image phase complete. Starting movie phase...");
+    let movie_ingest_ts = OffsetDateTime::now_utc().unix_timestamp().to_string();
+    let movie_discovered = Arc::new(AtomicU64::new(0));
+
+    let (movie_path_tx, movie_path_rx) = bounded::<PathBuf>(config.movie_path_queue_cap);
+    let (movie_result_tx, movie_result_rx) = bounded::<MovieProcessResult>(config.movie_result_queue_cap);
+
+    let movie_search_dir = config.search_dir.clone();
+    let movie_discover_counter = Arc::clone(&movie_discovered);
+    let movie_scanner = thread::spawn(move || {
+        for entry in WalkDir::new(movie_search_dir).into_iter().filter_map(|e| e.ok()) {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let ext = extension_of(entry.path());
+            if is_movie_extension(&ext) {
+                movie_discover_counter.fetch_add(1, Ordering::Relaxed);
+                if movie_path_tx.send(entry.path().to_owned()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut movie_workers_join = Vec::with_capacity(config.movie_workers);
+    for _ in 0..config.movie_workers {
+        let worker_rx = movie_path_rx.clone();
+        let worker_tx = movie_result_tx.clone();
+        let worker_ingest_ts = movie_ingest_ts.clone();
+        let worker_hash_downscale_size = config.hash_downscale_size;
+        let worker_movie_frame_samples = config.movie_frame_samples;
+
+        movie_workers_join.push(thread::spawn(move || {
+            for path in worker_rx.iter() {
+                let original_path = path.to_string_lossy().to_string();
+                let extension = extension_of(&path);
+                let detected = detect_video_format_from_path(&path);
+
+                if matches!(detected, DetectedVideoFormat::Unknown) {
+                    if worker_tx
+                        .send(MovieProcessResult::Error {
+                            path: original_path,
+                            message: "unsupported movie format".to_string(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                let output = match hash_video_perceptual(
+                    &path,
+                    worker_hash_downscale_size,
+                    worker_movie_frame_samples,
+                ) {
+                    Ok(hash) => MovieProcessResult::Hashed {
+                        hash,
+                        original_path,
+                        detected_format: detected.as_str().to_string(),
+                        extension,
+                        ingest_ts: worker_ingest_ts.clone(),
+                    },
+                    Err(message) => MovieProcessResult::Error {
+                        path: original_path,
+                        message,
+                    },
+                };
+
+                if worker_tx.send(output).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(movie_result_tx);
+
+    if dry_run {
+        while let Ok(result) = movie_result_rx.recv() {
+            movie_processed_total += 1;
+            match result {
+                MovieProcessResult::Hashed { .. } => {
+                    movie_inserted_total += 1;
+                }
+                MovieProcessResult::Error { path, message } => {
+                    errors += 1;
+                    if console_errors_printed < config.max_console_errors {
+                        eprintln!("Dry run movie error: {} (reason: {})", path, message);
+                        console_errors_printed += 1;
+                    } else {
+                        console_errors_suppressed += 1;
+                    }
+                }
+            }
+        }
+    } else {
+        let tx = conn
+            .as_mut()
+            .expect("database connection should exist when not in dry-run")
+            .transaction()?;
+        {
+            let mut insert_movie_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO movie_hashes (
+                    hash,
+                    original_path,
+                    detected_format,
+                    extension,
+                    ingest_ts
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+
+            while let Ok(result) = movie_result_rx.recv() {
+                movie_processed_total += 1;
+                match result {
+                    MovieProcessResult::Hashed {
+                        hash,
+                        original_path,
+                        detected_format,
+                        extension,
+                        ingest_ts,
+                    } => {
+                        let inserted = insert_movie_stmt.execute(params![
+                            hash,
+                            original_path,
+                            detected_format,
+                            extension,
+                            ingest_ts
+                        ])?;
+                        if inserted > 0 {
+                            movie_inserted_total += 1;
+                        }
+                    }
+                    MovieProcessResult::Error { path, message } => {
+                        errors += 1;
+                        if console_errors_printed < config.max_console_errors {
+                            eprintln!("Could not hash movie: {} (reason: {})", path, message);
+                            console_errors_printed += 1;
+                        } else {
+                            console_errors_suppressed += 1;
+                        }
+
+                        if let Some(writer) = error_log_writer.as_mut() {
+                            let _ = writeln!(writer, "path={}\taction=movie_error\treason={}", path, message);
+                        }
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+    }
+
+    if movie_scanner.join().is_err() {
+        eprintln!("Warning: movie scanner thread terminated unexpectedly");
+    }
+    for worker in movie_workers_join {
+        if worker.join().is_err() {
+            eprintln!("Warning: movie worker thread terminated unexpectedly");
+        }
+    }
+
+    let movie_discovered_total = movie_discovered.load(Ordering::Relaxed);
+
     let elapsed = start.elapsed();
     println!("Done. Elapsed time: {:.2?}", elapsed);
     println!("Total images discovered: {}", total_discovered);
     println!("Total images processed: {}", processed_total);
+    println!("Total movies discovered: {}", movie_discovered_total);
+    println!("Total movies processed: {}", movie_processed_total);
     println!("Total errors: {}", errors);
     println!("Total transcoded to JPG: {}", transcoded_total);
     println!("Total quarantined: {}", quarantined_total);
     if dry_run {
         println!("Dry run preview: hashable files that would be inserted: {}", total_inserted);
+        println!("Dry run preview: movie hashes that would be inserted: {}", movie_inserted_total);
     } else {
         println!("Total unique hashes inserted this run: {}", total_inserted);
+        println!("Total unique movie hashes inserted this run: {}", movie_inserted_total);
     }
 
     if let Some(mut writer) = error_log_writer {
