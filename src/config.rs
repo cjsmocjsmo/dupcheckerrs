@@ -1,7 +1,7 @@
 use crate::runutils::{env_flag, env_string, env_u32, env_u64, env_u8, env_usize};
 
 // Set all runtime behavior here, then build on rpi4 and copy only the binary to rpi3b+.
-const DUPCHECKER_DRY_RUN: bool = true;
+const DUPCHECKER_DRY_RUN: bool = false;
 const DUPCHECKER_WORKERS: usize = 3;
 const DUPCHECKER_HEARTBEAT_SECS: u64 = 15;
 const DUPCHECKER_STALL_WARN_SECS: u64 = 120;
