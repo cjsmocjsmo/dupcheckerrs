@@ -382,7 +382,7 @@ fn hash_video_perceptual(
         let frame_time = Time::from_seconds_f64(sample_secs);
 
         let frame_path = temp_root.join(format!(
-            "movie_{}_{}_{}_{}.jpg",
+            "movie_{}_{}_{}_{}.png",
             source_id,
             unique_run,
             std::process::id(),
@@ -391,7 +391,7 @@ fn hash_video_perceptual(
 
         let thumb_opts = ThumbnailOptions::new(frame_time)
             .size(target_size, target_size)
-            .format(ThumbnailFormat::Jpeg);
+            .format(ThumbnailFormat::Png);
 
         if let Err(e) = generate_thumbnail(path, &frame_path, &thumb_opts) {
             let _ = fs::remove_file(&frame_path);
@@ -1279,14 +1279,17 @@ fn main() -> Result<()> {
     pb.finish_with_message("Processing done");
 
     println!("Image phase complete. Starting movie phase...");
+    let movie_phase_start = Instant::now();
     let movie_ingest_ts = OffsetDateTime::now_utc().unix_timestamp().to_string();
     let movie_discovered = Arc::new(AtomicU64::new(0));
+    let movie_scanner_done = Arc::new(AtomicBool::new(false));
 
     let (movie_path_tx, movie_path_rx) = bounded::<PathBuf>(config.movie_path_queue_cap);
     let (movie_result_tx, movie_result_rx) = bounded::<MovieProcessResult>(config.movie_result_queue_cap);
 
     let movie_search_dir = config.search_dir.clone();
     let movie_discover_counter = Arc::clone(&movie_discovered);
+    let movie_scanner_done_flag = Arc::clone(&movie_scanner_done);
     let movie_scanner = thread::spawn(move || {
         for entry in WalkDir::new(movie_search_dir).into_iter().filter_map(|e| e.ok()) {
             if !entry.path().is_file() {
@@ -1300,6 +1303,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        movie_scanner_done_flag.store(true, Ordering::Relaxed);
     });
 
     let mut movie_workers_join = Vec::with_capacity(config.movie_workers);
@@ -1355,22 +1359,105 @@ fn main() -> Result<()> {
     }
     drop(movie_result_tx);
 
+    let mut movie_last_heartbeat_at = Instant::now();
+    let mut movie_last_heartbeat_processed = 0u64;
+    let mut movie_last_progress_at = Instant::now();
+    let mut movie_last_stall_warn_at = Instant::now();
+
     if dry_run {
-        while let Ok(result) = movie_result_rx.recv() {
-            movie_processed_total += 1;
-            match result {
-                MovieProcessResult::Hashed { .. } => {
-                    movie_inserted_total += 1;
-                }
-                MovieProcessResult::Error { path, message } => {
-                    errors += 1;
-                    if console_errors_printed < config.max_console_errors {
-                        eprintln!("Dry run movie error: {} (reason: {})", path, message);
-                        console_errors_printed += 1;
-                    } else {
-                        console_errors_suppressed += 1;
+        loop {
+            match movie_result_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(result) => {
+                    movie_processed_total += 1;
+                    movie_last_progress_at = Instant::now();
+                    match result {
+                        MovieProcessResult::Hashed { .. } => {
+                            movie_inserted_total += 1;
+                        }
+                        MovieProcessResult::Error { path, message } => {
+                            errors += 1;
+                            if console_errors_printed < config.max_console_errors {
+                                eprintln!("Dry run movie error: {} (reason: {})", path, message);
+                                console_errors_printed += 1;
+                            } else {
+                                console_errors_suppressed += 1;
+                            }
+                        }
                     }
                 }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+
+            let now = Instant::now();
+            if now.duration_since(movie_last_heartbeat_at) >= heartbeat_interval {
+                let discovered = movie_discovered.load(Ordering::Relaxed);
+                let scan_done = movie_scanner_done.load(Ordering::Relaxed);
+                let elapsed_secs = movie_phase_start.elapsed().as_secs_f64();
+                let avg_rate = if elapsed_secs > 0.0 {
+                    movie_processed_total as f64 / elapsed_secs
+                } else {
+                    0.0
+                };
+                let hb_delta_secs = now.duration_since(movie_last_heartbeat_at).as_secs_f64();
+                let hb_delta_processed =
+                    movie_processed_total.saturating_sub(movie_last_heartbeat_processed);
+                let instant_rate = if hb_delta_secs > 0.0 {
+                    hb_delta_processed as f64 / hb_delta_secs
+                } else {
+                    0.0
+                };
+                let pct = if scan_done && discovered > 0 {
+                    (movie_processed_total as f64 / discovered as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                let eta = if scan_done && discovered > movie_processed_total && instant_rate > 0.01 {
+                    let remaining = discovered - movie_processed_total;
+                    let eta_secs = (remaining as f64 / instant_rate) as u64;
+                    format_duration(eta_secs)
+                } else {
+                    "n/a".to_string()
+                };
+
+                eprintln!(
+                    "MOVIE HEARTBEAT elapsed={} discovered={} processed={} errors={} inserted={} avg_rate={:.2}/s inst_rate={:.2}/s scan_done={} pct={:.1}% eta={} q_path={} q_result={}",
+                    format_duration(movie_phase_start.elapsed().as_secs()),
+                    discovered,
+                    movie_processed_total,
+                    errors,
+                    movie_inserted_total,
+                    avg_rate,
+                    instant_rate,
+                    scan_done,
+                    pct,
+                    eta,
+                    movie_path_rx.len(),
+                    movie_result_rx.len()
+                );
+
+                pb.set_message(format!(
+                    "movies discovered={} processed={} err={} rate={:.2}/s",
+                    discovered, movie_processed_total, errors, avg_rate
+                ));
+                movie_last_heartbeat_at = now;
+                movie_last_heartbeat_processed = movie_processed_total;
+            }
+
+            if now.duration_since(movie_last_progress_at) >= stall_warn_interval
+                && now.duration_since(movie_last_stall_warn_at) >= heartbeat_interval
+            {
+                eprintln!(
+                    "WARN movie stall detected: no progress for {}s (discovered={} processed={} q_path={} q_result={} scan_done={})",
+                    now.duration_since(movie_last_progress_at).as_secs(),
+                    movie_discovered.load(Ordering::Relaxed),
+                    movie_processed_total,
+                    movie_path_rx.len(),
+                    movie_result_rx.len(),
+                    movie_scanner_done.load(Ordering::Relaxed)
+                );
+                movie_last_stall_warn_at = now;
             }
         }
     } else {
@@ -1390,40 +1477,118 @@ fn main() -> Result<()> {
                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
 
-            while let Ok(result) = movie_result_rx.recv() {
-                movie_processed_total += 1;
-                match result {
-                    MovieProcessResult::Hashed {
-                        hash,
-                        original_path,
-                        detected_format,
-                        extension,
-                        ingest_ts,
-                    } => {
-                        let inserted = insert_movie_stmt.execute(params![
-                            hash,
-                            original_path,
-                            detected_format,
-                            extension,
-                            ingest_ts
-                        ])?;
-                        if inserted > 0 {
-                            movie_inserted_total += 1;
-                        }
-                    }
-                    MovieProcessResult::Error { path, message } => {
-                        errors += 1;
-                        if console_errors_printed < config.max_console_errors {
-                            eprintln!("Could not hash movie: {} (reason: {})", path, message);
-                            console_errors_printed += 1;
-                        } else {
-                            console_errors_suppressed += 1;
-                        }
+            loop {
+                match movie_result_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(result) => {
+                        movie_processed_total += 1;
+                        movie_last_progress_at = Instant::now();
+                        match result {
+                            MovieProcessResult::Hashed {
+                                hash,
+                                original_path,
+                                detected_format,
+                                extension,
+                                ingest_ts,
+                            } => {
+                                let inserted = insert_movie_stmt.execute(params![
+                                    hash,
+                                    original_path,
+                                    detected_format,
+                                    extension,
+                                    ingest_ts
+                                ])?;
+                                if inserted > 0 {
+                                    movie_inserted_total += 1;
+                                }
+                            }
+                            MovieProcessResult::Error { path, message } => {
+                                errors += 1;
+                                if console_errors_printed < config.max_console_errors {
+                                    eprintln!("Could not hash movie: {} (reason: {})", path, message);
+                                    console_errors_printed += 1;
+                                } else {
+                                    console_errors_suppressed += 1;
+                                }
 
-                        if let Some(writer) = error_log_writer.as_mut() {
-                            let _ = writeln!(writer, "path={}\taction=movie_error\treason={}", path, message);
+                                if let Some(writer) = error_log_writer.as_mut() {
+                                    let _ = writeln!(writer, "path={}\taction=movie_error\treason={}", path, message);
+                                }
+                            }
                         }
                     }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+
+                let now = Instant::now();
+                if now.duration_since(movie_last_heartbeat_at) >= heartbeat_interval {
+                    let discovered = movie_discovered.load(Ordering::Relaxed);
+                    let scan_done = movie_scanner_done.load(Ordering::Relaxed);
+                    let elapsed_secs = movie_phase_start.elapsed().as_secs_f64();
+                    let avg_rate = if elapsed_secs > 0.0 {
+                        movie_processed_total as f64 / elapsed_secs
+                    } else {
+                        0.0
+                    };
+                    let hb_delta_secs = now.duration_since(movie_last_heartbeat_at).as_secs_f64();
+                    let hb_delta_processed =
+                        movie_processed_total.saturating_sub(movie_last_heartbeat_processed);
+                    let instant_rate = if hb_delta_secs > 0.0 {
+                        hb_delta_processed as f64 / hb_delta_secs
+                    } else {
+                        0.0
+                    };
+                    let pct = if scan_done && discovered > 0 {
+                        (movie_processed_total as f64 / discovered as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    let eta = if scan_done && discovered > movie_processed_total && instant_rate > 0.01 {
+                        let remaining = discovered - movie_processed_total;
+                        let eta_secs = (remaining as f64 / instant_rate) as u64;
+                        format_duration(eta_secs)
+                    } else {
+                        "n/a".to_string()
+                    };
+
+                    eprintln!(
+                        "MOVIE HEARTBEAT elapsed={} discovered={} processed={} errors={} inserted={} avg_rate={:.2}/s inst_rate={:.2}/s scan_done={} pct={:.1}% eta={} q_path={} q_result={}",
+                        format_duration(movie_phase_start.elapsed().as_secs()),
+                        discovered,
+                        movie_processed_total,
+                        errors,
+                        movie_inserted_total,
+                        avg_rate,
+                        instant_rate,
+                        scan_done,
+                        pct,
+                        eta,
+                        movie_path_rx.len(),
+                        movie_result_rx.len()
+                    );
+
+                    pb.set_message(format!(
+                        "movies discovered={} processed={} err={} rate={:.2}/s",
+                        discovered, movie_processed_total, errors, avg_rate
+                    ));
+                    movie_last_heartbeat_at = now;
+                    movie_last_heartbeat_processed = movie_processed_total;
+                }
+
+                if now.duration_since(movie_last_progress_at) >= stall_warn_interval
+                    && now.duration_since(movie_last_stall_warn_at) >= heartbeat_interval
+                {
+                    eprintln!(
+                        "WARN movie stall detected: no progress for {}s (discovered={} processed={} q_path={} q_result={} scan_done={})",
+                        now.duration_since(movie_last_progress_at).as_secs(),
+                        movie_discovered.load(Ordering::Relaxed),
+                        movie_processed_total,
+                        movie_path_rx.len(),
+                        movie_result_rx.len(),
+                        movie_scanner_done.load(Ordering::Relaxed)
+                    );
+                    movie_last_stall_warn_at = now;
                 }
             }
         }
