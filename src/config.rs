@@ -1,4 +1,5 @@
 use crate::runutils::{env_flag, env_string, env_u32, env_u64, env_u8, env_usize};
+use std::env;
 
 // Set all runtime behavior here, then build on rpi4 and copy only the binary to rpi3b+.
 const DUPCHECKER_DRY_RUN: bool = false;
@@ -7,7 +8,7 @@ const DUPCHECKER_HEARTBEAT_SECS: u64 = 15;
 const DUPCHECKER_STALL_WARN_SECS: u64 = 120;
 const DUPCHECKER_PROGRESS_ENABLED: bool = true;
 const DUPCHECKER_DB_PATH: &str = "/media/PiTB/images.db";
-const DUPCHECKER_SEARCH_DIR: &str = "/media/PiTB/foofuck/MASTERPICS";
+const DUPCHECKER_SEARCH_DIR: &str = "/media/PiTB/foofuck";
 const DUPCHECKER_ERROR_LOG_FILE: &str = "dupcheckerrs-errors.log";
 const DUPCHECKER_TRANSCODE_DIR_NAME: &str = "transcoded_jpg";
 const DUPCHECKER_QUARANTINE_DIR_NAME: &str = "quarantine";
@@ -15,11 +16,13 @@ const DUPCHECKER_MAX_CONSOLE_ERRORS: u64 = 20;
 const DUPCHECKER_PATH_QUEUE_CAP: usize = 2048;
 const DUPCHECKER_RESULT_QUEUE_CAP: usize = 2048;
 const DUPCHECKER_JPEG_QUALITY: u8 = 95;
-const DUPCHECKER_HASH_DOWNSCALE_SIZE: u32 = 124;
+const DUPCHECKER_HASH_DOWNSCALE_SIZE: u32 = 128;
 const DUPCHECKER_MOVIE_WORKERS: usize = 1;
 const DUPCHECKER_MOVIE_FRAME_SAMPLES: usize = 5;
 const DUPCHECKER_MOVIE_PATH_QUEUE_CAP: usize = 512;
 const DUPCHECKER_MOVIE_RESULT_QUEUE_CAP: usize = 512;
+const DUPCHECKER_MASTER_IMAGE_DIR: &str = "";
+const DUPCHECKER_MASTER_MOVIE_DIR: &str = "";
 
 // Optional compatibility mode: when true, environment variables can override the constants above.
 const ENABLE_ENV_OVERRIDES: bool = false;
@@ -38,6 +41,8 @@ const ENV_PATH_QUEUE_CAP: &str = "DUPCHECKER_PATH_QUEUE_CAP";
 const ENV_RESULT_QUEUE_CAP: &str = "DUPCHECKER_RESULT_QUEUE_CAP";
 const ENV_JPEG_QUALITY: &str = "DUPCHECKER_JPEG_QUALITY";
 const ENV_HASH_DOWNSCALE_SIZE: &str = "DUPCHECKER_HASH_DOWNSCALE_SIZE";
+const ENV_MASTER_IMAGE_DIR: &str = "DUPCHECKER_MASTER_IMAGE_DIR";
+const ENV_MASTER_MOVIE_DIR: &str = "DUPCHECKER_MASTER_MOVIE_DIR";
 
 pub struct RuntimeConfig {
     pub dry_run: bool,
@@ -59,6 +64,8 @@ pub struct RuntimeConfig {
     pub movie_frame_samples: usize,
     pub movie_path_queue_cap: usize,
     pub movie_result_queue_cap: usize,
+    pub master_image_dir: String,
+    pub master_movie_dir: String,
     pub env_overrides_enabled: bool,
 }
 
@@ -84,10 +91,12 @@ impl RuntimeConfig {
             movie_frame_samples: DUPCHECKER_MOVIE_FRAME_SAMPLES.max(1),
             movie_path_queue_cap: DUPCHECKER_MOVIE_PATH_QUEUE_CAP.max(1),
             movie_result_queue_cap: DUPCHECKER_MOVIE_RESULT_QUEUE_CAP.max(1),
+            master_image_dir: DUPCHECKER_MASTER_IMAGE_DIR.to_string(),
+            master_movie_dir: DUPCHECKER_MASTER_MOVIE_DIR.to_string(),
             env_overrides_enabled: ENABLE_ENV_OVERRIDES,
         };
 
-        if ENABLE_ENV_OVERRIDES {
+        let mut loaded = if ENABLE_ENV_OVERRIDES {
             RuntimeConfig {
                 dry_run: env_flag(ENV_DRY_RUN) || base.dry_run,
                 workers: env_usize(ENV_WORKERS, base.workers),
@@ -109,10 +118,26 @@ impl RuntimeConfig {
                 movie_frame_samples: base.movie_frame_samples,
                 movie_path_queue_cap: base.movie_path_queue_cap,
                 movie_result_queue_cap: base.movie_result_queue_cap,
+                master_image_dir: base.master_image_dir.clone(),
+                master_movie_dir: base.master_movie_dir.clone(),
                 env_overrides_enabled: ENABLE_ENV_OVERRIDES,
             }
         } else {
             base
-        }
+        };
+
+        // Copy phases are opt-in: destination dirs are set only when env vars are present and non-empty.
+        loaded.master_image_dir = env::var(ENV_MASTER_IMAGE_DIR)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| loaded.master_image_dir.trim().to_string());
+        loaded.master_movie_dir = env::var(ENV_MASTER_MOVIE_DIR)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| loaded.master_movie_dir.trim().to_string());
+
+        loaded
     }
 }

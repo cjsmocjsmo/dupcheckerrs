@@ -4,11 +4,11 @@ mod imgutils;
 mod movutils;
 mod runutils;
 
-use rusqlite::{params, Result};
+use rusqlite::{params, Connection, Result};
 use crossbeam_channel::{bounded, RecvTimeoutError};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -24,6 +24,136 @@ use crate::runutils::{
     log_movie_stall_warning, print_run_summary, warn_if_any_join_failed, warn_if_join_failed,
     write_optional_log_line,
 };
+
+#[derive(Default)]
+struct CopyStats {
+    attempted: u64,
+    copied: u64,
+    skipped_missing: u64,
+    skipped_existing: u64,
+    failed: u64,
+}
+
+fn sanitize_hash_for_filename(hash: &str) -> String {
+    hash.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn fetch_hash_source_rows(conn: &Connection, table_name: &str) -> Result<Vec<(String, String)>> {
+    let sql = format!(
+        "SELECT hash, original_path FROM {} WHERE original_path IS NOT NULL AND original_path <> ''",
+        table_name
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mapped = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(rows)
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1")?;
+    let mut rows = stmt.query(params![table_name])?;
+    Ok(rows.next()?.is_some())
+}
+
+fn copy_rows_to_dir(rows: Vec<(String, String)>, destination_dir: &Path, media_label: &str) -> CopyStats {
+    if let Err(e) = fs::create_dir_all(destination_dir) {
+        eprintln!(
+            "{} copy skipped: cannot create destination directory {}: {}",
+            media_label,
+            destination_dir.display(),
+            e
+        );
+        return CopyStats::default();
+    }
+
+    let mut stats = CopyStats::default();
+    for (hash, source_path) in rows {
+        stats.attempted += 1;
+
+        let source = PathBuf::from(&source_path);
+        if !source.is_file() {
+            stats.skipped_missing += 1;
+            continue;
+        }
+
+        let source_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown_file");
+        let target_name = format!("{}__{}", sanitize_hash_for_filename(&hash), source_name);
+        let target = destination_dir.join(target_name);
+
+        if target.exists() {
+            stats.skipped_existing += 1;
+            continue;
+        }
+
+        match fs::copy(&source, &target) {
+            Ok(_) => stats.copied += 1,
+            Err(err) => {
+                stats.failed += 1;
+                eprintln!(
+                    "Failed to copy {} from {} to {}: {}",
+                    media_label,
+                    source.display(),
+                    target.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    stats
+}
+
+fn copy_unique_images_from_hashes(conn: &Connection, destination_dir: &Path) -> Result<()> {
+    let rows = fetch_hash_source_rows(conn, "hashes")?;
+    let stats = copy_rows_to_dir(rows, destination_dir, "image");
+    println!(
+        "Image master copy complete: attempted={} copied={} skipped_missing={} skipped_existing={} failed={} destination={}",
+        stats.attempted,
+        stats.copied,
+        stats.skipped_missing,
+        stats.skipped_existing,
+        stats.failed,
+        destination_dir.display()
+    );
+    Ok(())
+}
+
+fn copy_unique_movies_from_hashes(conn: &Connection, destination_dir: &Path) -> Result<()> {
+    let table_name = "movie_hashes";
+    if !table_exists(conn, table_name)? {
+        eprintln!(
+            "Movie master copy skipped: table {} does not exist",
+            table_name
+        );
+        return Ok(());
+    }
+
+    let rows = fetch_hash_source_rows(conn, table_name)?;
+    let stats = copy_rows_to_dir(rows, destination_dir, "movie");
+    println!(
+        "Movie master copy complete: table={} attempted={} copied={} skipped_missing={} skipped_existing={} failed={} destination={}",
+        table_name,
+        stats.attempted,
+        stats.copied,
+        stats.skipped_missing,
+        stats.skipped_existing,
+        stats.failed,
+        destination_dir.display()
+    );
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let start = Instant::now();
@@ -68,7 +198,7 @@ fn main() -> Result<()> {
         workers
     );
     eprintln!(
-        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} image_queue_caps=({}, {}) movie_workers={} movie_frame_samples={} movie_queue_caps=({}, {}) max_console_errors={} env_overrides={}",
+        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} image_queue_caps=({}, {}) movie_workers={} movie_frame_samples={} movie_queue_caps=({}, {}) max_console_errors={} env_overrides={} master_image_dir={} master_movie_dir={}",
         config.search_dir,
         config.db_path,
         heartbeat_secs,
@@ -83,7 +213,9 @@ fn main() -> Result<()> {
         config.movie_path_queue_cap,
         config.movie_result_queue_cap,
         config.max_console_errors,
-        config.env_overrides_enabled
+        config.env_overrides_enabled,
+        config.master_image_dir,
+        config.master_movie_dir
     );
 
     let mut conn = open_database(dry_run, &config.db_path)?;
@@ -414,6 +546,15 @@ fn main() -> Result<()> {
     pb.set_message(format!("discovered={} processed={}", total_discovered, processed_total));
     pb.finish_with_message("Processing done");
 
+    if !dry_run {
+        if config.master_image_dir.trim().is_empty() {
+            eprintln!("Image master copy skipped: DUPCHECKER_MASTER_IMAGE_DIR is not set");
+        } else if let Some(existing_conn) = conn.as_ref() {
+            let image_master_dir = PathBuf::from(&config.master_image_dir);
+            copy_unique_images_from_hashes(existing_conn, &image_master_dir)?;
+        }
+    }
+
     println!("Image phase complete. Starting movie phase...");
     let movie_phase_start = Instant::now();
     let movie_ingest_ts = OffsetDateTime::now_utc().unix_timestamp().to_string();
@@ -626,6 +767,15 @@ fn main() -> Result<()> {
         movie_workers_join,
         "Warning: movie worker thread terminated unexpectedly",
     );
+
+    if !dry_run {
+        if config.master_movie_dir.trim().is_empty() {
+            eprintln!("Movie master copy skipped: DUPCHECKER_MASTER_MOVIE_DIR is not set");
+        } else if let Some(existing_conn) = conn.as_ref() {
+            let movie_master_dir = PathBuf::from(&config.master_movie_dir);
+            copy_unique_movies_from_hashes(existing_conn, &movie_master_dir)?;
+        }
+    }
 
     let movie_discovered_total = movie_discovered.load(Ordering::Relaxed);
 
