@@ -63,7 +63,12 @@ fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
     Ok(rows.next()?.is_some())
 }
 
-fn copy_rows_to_dir(rows: Vec<(String, String)>, destination_dir: &Path, media_label: &str) -> CopyStats {
+fn copy_rows_to_dir(
+    rows: Vec<(String, String)>,
+    destination_dir: &Path,
+    media_label: &str,
+    progress_enabled: bool,
+) -> CopyStats {
     if let Err(e) = fs::create_dir_all(destination_dir) {
         eprintln!(
             "{} copy skipped: cannot create destination directory {}: {}",
@@ -74,6 +79,24 @@ fn copy_rows_to_dir(rows: Vec<(String, String)>, destination_dir: &Path, media_l
         return CopyStats::default();
     }
 
+    let copy_total = rows.len() as u64;
+    let copy_pb = ProgressBar::new(copy_total);
+    copy_pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) eta {eta}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    if progress_enabled {
+        copy_pb.enable_steady_tick(Duration::from_millis(200));
+        copy_pb.set_message(format!("Copying {} files", media_label));
+    } else {
+        copy_pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
+
     let mut stats = CopyStats::default();
     for (hash, source_path) in rows {
         stats.attempted += 1;
@@ -81,19 +104,16 @@ fn copy_rows_to_dir(rows: Vec<(String, String)>, destination_dir: &Path, media_l
         let source = PathBuf::from(&source_path);
         if !source.is_file() {
             stats.skipped_missing += 1;
+            copy_pb.inc(1);
             continue;
         }
 
-        let source_name = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("unknown_file");
-        let target_name = format!("{}__{}", sanitize_hash_for_filename(&hash), source_name);
+        let target_name = sanitize_hash_for_filename(&hash);
         let target = destination_dir.join(target_name);
 
         if target.exists() {
             stats.skipped_existing += 1;
+            copy_pb.inc(1);
             continue;
         }
 
@@ -110,14 +130,24 @@ fn copy_rows_to_dir(rows: Vec<(String, String)>, destination_dir: &Path, media_l
                 );
             }
         }
+
+        copy_pb.inc(1);
+    }
+
+    if progress_enabled {
+        copy_pb.finish_with_message(format!("Finished copying {} files", media_label));
     }
 
     stats
 }
 
-fn copy_unique_images_from_hashes(conn: &Connection, destination_dir: &Path) -> Result<()> {
+fn copy_unique_images_from_hashes(
+    conn: &Connection,
+    destination_dir: &Path,
+    progress_enabled: bool,
+) -> Result<()> {
     let rows = fetch_hash_source_rows(conn, "hashes")?;
-    let stats = copy_rows_to_dir(rows, destination_dir, "image");
+    let stats = copy_rows_to_dir(rows, destination_dir, "image", progress_enabled);
     println!(
         "Image master copy complete: attempted={} copied={} skipped_missing={} skipped_existing={} failed={} destination={}",
         stats.attempted,
@@ -130,7 +160,11 @@ fn copy_unique_images_from_hashes(conn: &Connection, destination_dir: &Path) -> 
     Ok(())
 }
 
-fn copy_unique_movies_from_hashes(conn: &Connection, destination_dir: &Path) -> Result<()> {
+fn copy_unique_movies_from_hashes(
+    conn: &Connection,
+    destination_dir: &Path,
+    progress_enabled: bool,
+) -> Result<()> {
     let table_name = "movie_hashes";
     if !table_exists(conn, table_name)? {
         eprintln!(
@@ -141,7 +175,7 @@ fn copy_unique_movies_from_hashes(conn: &Connection, destination_dir: &Path) -> 
     }
 
     let rows = fetch_hash_source_rows(conn, table_name)?;
-    let stats = copy_rows_to_dir(rows, destination_dir, "movie");
+    let stats = copy_rows_to_dir(rows, destination_dir, "movie", progress_enabled);
     println!(
         "Movie master copy complete: table={} attempted={} copied={} skipped_missing={} skipped_existing={} failed={} destination={}",
         table_name,
@@ -551,7 +585,7 @@ fn main() -> Result<()> {
             eprintln!("Image master copy skipped: DUPCHECKER_MASTER_IMAGE_DIR is not set");
         } else if let Some(existing_conn) = conn.as_ref() {
             let image_master_dir = PathBuf::from(&config.master_image_dir);
-            copy_unique_images_from_hashes(existing_conn, &image_master_dir)?;
+            copy_unique_images_from_hashes(existing_conn, &image_master_dir, progress_enabled)?;
         }
     }
 
@@ -773,7 +807,7 @@ fn main() -> Result<()> {
             eprintln!("Movie master copy skipped: DUPCHECKER_MASTER_MOVIE_DIR is not set");
         } else if let Some(existing_conn) = conn.as_ref() {
             let movie_master_dir = PathBuf::from(&config.master_movie_dir);
-            copy_unique_movies_from_hashes(existing_conn, &movie_master_dir)?;
+            copy_unique_movies_from_hashes(existing_conn, &movie_master_dir, progress_enabled)?;
         }
     }
 
