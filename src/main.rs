@@ -111,6 +111,8 @@ fn main() -> Result<()> {
     let mut transcoded_total = 0u64;
     let mut movie_processed_total = 0u64;
     let mut movie_inserted_total = 0u64;
+    let mut image_db_rejected_total = 0u64;
+    let mut movie_db_rejected_total = 0u64;
 
     let mut error_log_writer = if dry_run {
         None
@@ -315,6 +317,8 @@ fn main() -> Result<()> {
                                 ])?;
                                 if inserted > 0 {
                                     total_inserted += 1;
+                                } else {
+                                    image_db_rejected_total += 1;
                                 }
                             }
                             ProcessResult::Quarantined {
@@ -557,6 +561,8 @@ fn main() -> Result<()> {
                                 ])?;
                                 if inserted > 0 {
                                     movie_inserted_total += 1;
+                                } else {
+                                    movie_db_rejected_total += 1;
                                 }
                             }
                             MovieProcessResult::Error { path, message } => {
@@ -636,6 +642,8 @@ fn main() -> Result<()> {
         dry_run,
         total_inserted,
         movie_inserted_total,
+        image_db_rejected_total,
+        movie_db_rejected_total,
         console_errors_suppressed,
         &error_log_path,
     );

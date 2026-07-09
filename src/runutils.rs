@@ -276,6 +276,8 @@ pub fn print_run_summary(
     dry_run: bool,
     total_hashes_inserted: u64,
     total_movie_hashes_inserted: u64,
+    image_db_rejected_total: u64,
+    movie_db_rejected_total: u64,
     console_errors_suppressed: u64,
     error_log_path: &Path,
 ) {
@@ -301,6 +303,14 @@ pub fn print_run_summary(
         println!(
             "Total unique movie hashes inserted this run: {}",
             total_movie_hashes_inserted
+        );
+        println!(
+            "Total image rows rejected by DB (duplicate hash): {}",
+            image_db_rejected_total
+        );
+        println!(
+            "Total movie rows rejected by DB (duplicate hash): {}",
+            movie_db_rejected_total
         );
     }
 
