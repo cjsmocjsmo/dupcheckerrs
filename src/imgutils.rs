@@ -12,6 +12,10 @@ use std::{fs, io};
 use turbojpeg;
 use walkdir::WalkDir;
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 #[derive(Clone, Copy)]
 pub enum DetectedFormat {
     Jpeg,
@@ -207,9 +211,8 @@ pub fn process_image_path(
                         hash_downscale_size,
                         FilterType::Triangle,
                     );
-                    let hash = hasher
-                        .hash_image(&DynamicImage::ImageLuma8(downscaled))
-                        .to_base64();
+                    let perceptual_hash = hasher.hash_image(&DynamicImage::ImageLuma8(downscaled));
+                    let hash = bytes_to_hex(perceptual_hash.as_bytes());
                     let stored_path = original_path.clone();
 
                     ProcessResult::Hashed {
@@ -289,7 +292,8 @@ pub fn process_image_path(
                     (original_path.clone(), "kept_jpeg".to_string(), None)
                 };
 
-                let hash = hasher.hash_image(&img).to_base64();
+                let perceptual_hash = hasher.hash_image(&img);
+                let hash = bytes_to_hex(perceptual_hash.as_bytes());
                 ProcessResult::Hashed {
                     hash,
                     original_path,

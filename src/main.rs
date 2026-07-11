@@ -40,14 +40,58 @@ fn sanitize_hash_for_filename(hash: &str) -> String {
         .collect()
 }
 
-fn fetch_hash_source_rows(conn: &Connection, table_name: &str) -> Result<Vec<(String, String)>> {
+fn sanitize_extension_for_filename(ext: &str) -> String {
+    let sanitized: String = ext
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+
+    if sanitized.is_empty() {
+        "bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn build_target_filename(hash: &str, extension: &str) -> String {
+    format!(
+        "{}.{}",
+        sanitize_hash_for_filename(hash),
+        sanitize_extension_for_filename(extension)
+    )
+}
+
+fn fetch_image_copy_rows(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let sql = "SELECT hash, original_path, original_extension FROM hashes WHERE original_path IS NOT NULL AND original_path <> ''";
+    let mut stmt = conn.prepare(sql)?;
+    let mapped = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(rows)
+}
+
+fn fetch_movie_copy_rows(conn: &Connection, table_name: &str) -> Result<Vec<(String, String, String)>> {
     let sql = format!(
-        "SELECT hash, original_path FROM {} WHERE original_path IS NOT NULL AND original_path <> ''",
+        "SELECT hash, original_path, extension FROM {} WHERE original_path IS NOT NULL AND original_path <> ''",
         table_name
     );
     let mut stmt = conn.prepare(&sql)?;
     let mapped = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
 
     let mut rows = Vec::new();
@@ -64,7 +108,7 @@ fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
 }
 
 fn copy_rows_to_dir(
-    rows: Vec<(String, String)>,
+    rows: Vec<(String, String, String)>,
     destination_dir: &Path,
     media_label: &str,
     progress_enabled: bool,
@@ -98,7 +142,7 @@ fn copy_rows_to_dir(
     }
 
     let mut stats = CopyStats::default();
-    for (hash, source_path) in rows {
+    for (hash, source_path, extension) in rows {
         stats.attempted += 1;
 
         let source = PathBuf::from(&source_path);
@@ -108,7 +152,7 @@ fn copy_rows_to_dir(
             continue;
         }
 
-        let target_name = sanitize_hash_for_filename(&hash);
+        let target_name = build_target_filename(&hash, &extension);
         let target = destination_dir.join(target_name);
 
         if target.exists() {
@@ -146,7 +190,7 @@ fn copy_unique_images_from_hashes(
     destination_dir: &Path,
     progress_enabled: bool,
 ) -> Result<()> {
-    let rows = fetch_hash_source_rows(conn, "hashes")?;
+    let rows = fetch_image_copy_rows(conn)?;
     let stats = copy_rows_to_dir(rows, destination_dir, "image", progress_enabled);
     println!(
         "Image master copy complete: attempted={} copied={} skipped_missing={} skipped_existing={} failed={} destination={}",
@@ -174,7 +218,7 @@ fn copy_unique_movies_from_hashes(
         return Ok(());
     }
 
-    let rows = fetch_hash_source_rows(conn, table_name)?;
+    let rows = fetch_movie_copy_rows(conn, table_name)?;
     let stats = copy_rows_to_dir(rows, destination_dir, "movie", progress_enabled);
     println!(
         "Movie master copy complete: table={} attempted={} copied={} skipped_missing={} skipped_existing={} failed={} destination={}",
