@@ -18,7 +18,10 @@ use time::OffsetDateTime;
 use crate::config::RuntimeConfig;
 use crate::dbutils::open_database;
 use crate::imgutils::{process_image_path, scan_image_paths, ProcessResult};
-use crate::movutils::{process_movie_path, scan_movie_paths, MovieProcessResult};
+use crate::movutils::{
+    ensure_ffmpeg_available, movie_needs_mp4_transcode, process_movie_path, scan_movie_paths,
+    transcode_movie_to_mp4, MovieProcessResult, MovieTranscodeSettings,
+};
 use crate::runutils::{
     log_console_limited, log_image_heartbeat, log_image_stall_warning, log_movie_heartbeat,
     log_movie_stall_warning, print_run_summary, warn_if_any_join_failed, warn_if_join_failed,
@@ -32,6 +35,17 @@ struct CopyStats {
     skipped_missing: u64,
     skipped_existing: u64,
     failed: u64,
+}
+
+#[derive(Default)]
+struct MovieCopyStats {
+    attempted: u64,
+    copied_passthrough: u64,
+    transcoded: u64,
+    skipped_missing: u64,
+    skipped_existing: u64,
+    failed_copy: u64,
+    failed_transcode: u64,
 }
 
 fn sanitize_hash_for_filename(hash: &str) -> String {
@@ -80,9 +94,12 @@ fn fetch_image_copy_rows(conn: &Connection) -> Result<Vec<(String, String, Strin
     Ok(rows)
 }
 
-fn fetch_movie_copy_rows(conn: &Connection, table_name: &str) -> Result<Vec<(String, String, String)>> {
+fn fetch_movie_copy_rows(
+    conn: &Connection,
+    table_name: &str,
+) -> Result<Vec<(String, String, String, String)>> {
     let sql = format!(
-        "SELECT hash, original_path, extension FROM {} WHERE original_path IS NOT NULL AND original_path <> ''",
+        "SELECT hash, original_path, extension, detected_format FROM {} WHERE original_path IS NOT NULL AND original_path <> ''",
         table_name
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -91,6 +108,7 @@ fn fetch_movie_copy_rows(conn: &Connection, table_name: &str) -> Result<Vec<(Str
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
 
@@ -207,6 +225,9 @@ fn copy_unique_images_from_hashes(
 fn copy_unique_movies_from_hashes(
     conn: &Connection,
     destination_dir: &Path,
+    transcode_non_mp4: bool,
+    transcode_settings: &MovieTranscodeSettings,
+    error_log_writer: &mut Option<BufWriter<fs::File>>,
     progress_enabled: bool,
 ) -> Result<()> {
     let table_name = "movie_hashes";
@@ -218,18 +239,200 @@ fn copy_unique_movies_from_hashes(
         return Ok(());
     }
 
+    if let Err(e) = fs::create_dir_all(destination_dir) {
+        eprintln!(
+            "Movie master copy skipped: cannot create destination directory {}: {}",
+            destination_dir.display(),
+            e
+        );
+        return Ok(());
+    }
+
     let rows = fetch_movie_copy_rows(conn, table_name)?;
-    let stats = copy_rows_to_dir(rows, destination_dir, "movie", progress_enabled);
+
+    let movie_total = rows.len() as u64;
+    let movie_pb = ProgressBar::new(movie_total);
+    movie_pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} {msg} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) eta {eta}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    if progress_enabled {
+        movie_pb.enable_steady_tick(Duration::from_millis(200));
+        movie_pb.set_message("Materializing movie files".to_string());
+    } else {
+        movie_pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
+
+    let ffmpeg_ready = if transcode_non_mp4 {
+        match ensure_ffmpeg_available() {
+            Ok(_) => true,
+            Err(message) => {
+                eprintln!(
+                    "Movie transcode disabled for this run: {}. Non-mp4 files will be skipped.",
+                    message
+                );
+                write_optional_log_line(
+                    error_log_writer,
+                    &format!(
+                        "path=<startup>\taction=movie_transcode_error\treason=ffmpeg unavailable: {}",
+                        message
+                    ),
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let mut stats = MovieCopyStats::default();
+    for (hash, source_path, extension, detected_format) in rows {
+        stats.attempted += 1;
+
+        let source = PathBuf::from(&source_path);
+        if !source.is_file() {
+            stats.skipped_missing += 1;
+            movie_pb.inc(1);
+            continue;
+        }
+
+        let should_transcode = transcode_non_mp4 && movie_needs_mp4_transcode(&extension, &detected_format);
+        let target_name = if should_transcode {
+            build_target_filename(&hash, "mp4")
+        } else {
+            build_target_filename(&hash, &extension)
+        };
+        let target = destination_dir.join(target_name);
+
+        if target.exists() {
+            stats.skipped_existing += 1;
+            movie_pb.inc(1);
+            continue;
+        }
+
+        if should_transcode {
+            if !ffmpeg_ready {
+                stats.failed_transcode += 1;
+                write_optional_log_line(
+                    error_log_writer,
+                    &format!(
+                        "path={}\taction=movie_transcode_error\treason=ffmpeg unavailable",
+                        source.display()
+                    ),
+                );
+                movie_pb.inc(1);
+                continue;
+            }
+
+            let temp_target = destination_dir.join(format!(
+                "{}.{}.tmp.mp4",
+                sanitize_hash_for_filename(&hash),
+                std::process::id()
+            ));
+
+            match transcode_movie_to_mp4(&source, &temp_target, transcode_settings) {
+                Ok(_) => {
+                    if let Err(err) = fs::rename(&temp_target, &target) {
+                        let _ = fs::remove_file(&temp_target);
+                        stats.failed_transcode += 1;
+                        eprintln!(
+                            "Failed to finalize transcoded movie from {} to {}: {}",
+                            source.display(),
+                            target.display(),
+                            err
+                        );
+                        write_optional_log_line(
+                            error_log_writer,
+                            &format!(
+                                "path={}\taction=movie_transcode_error\treason=rename failed: {}\ttarget={}",
+                                source.display(),
+                                err,
+                                target.display()
+                            ),
+                        );
+                    } else {
+                        stats.transcoded += 1;
+                    }
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&temp_target);
+                    stats.failed_transcode += 1;
+                    eprintln!(
+                        "Failed to transcode movie from {} to {}: {}",
+                        source.display(),
+                        target.display(),
+                        err
+                    );
+                    write_optional_log_line(
+                        error_log_writer,
+                        &format!(
+                            "path={}\taction=movie_transcode_error\treason={}\ttarget={}",
+                            source.display(),
+                            err,
+                            target.display()
+                        ),
+                    );
+                }
+            }
+        } else {
+            match fs::copy(&source, &target) {
+                Ok(_) => stats.copied_passthrough += 1,
+                Err(err) => {
+                    stats.failed_copy += 1;
+                    eprintln!(
+                        "Failed to copy movie from {} to {}: {}",
+                        source.display(),
+                        target.display(),
+                        err
+                    );
+                    write_optional_log_line(
+                        error_log_writer,
+                        &format!(
+                            "path={}\taction=movie_copy_error\treason={}\ttarget={}",
+                            source.display(),
+                            err,
+                            target.display()
+                        ),
+                    );
+                }
+            }
+        }
+
+        movie_pb.inc(1);
+    }
+
+    if progress_enabled {
+        movie_pb.finish_with_message("Finished materializing movie files".to_string());
+    }
+
     println!(
-        "Movie master copy complete: table={} attempted={} copied={} skipped_missing={} skipped_existing={} failed={} destination={}",
+        "Movie master copy complete: table={} attempted={} copied_passthrough={} transcoded_to_mp4={} skipped_missing={} skipped_existing={} failed_copy={} failed_transcode={} destination={}",
         table_name,
         stats.attempted,
-        stats.copied,
+        stats.copied_passthrough,
+        stats.transcoded,
         stats.skipped_missing,
         stats.skipped_existing,
-        stats.failed,
+        stats.failed_copy,
+        stats.failed_transcode,
         destination_dir.display()
     );
+
+    if transcode_non_mp4 {
+        println!(
+            "Movie transcode settings: crf={} preset={} audio_bitrate={}k max_width={} (0 means no resize)",
+            transcode_settings.crf,
+            transcode_settings.preset,
+            transcode_settings.audio_bitrate_k,
+            transcode_settings.max_width
+        );
+    }
+
     Ok(())
 }
 
@@ -276,7 +479,7 @@ fn main() -> Result<()> {
         workers
     );
     eprintln!(
-        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} image_queue_caps=({}, {}) movie_workers={} movie_frame_samples={} movie_queue_caps=({}, {}) max_console_errors={} env_overrides={} master_image_dir={} master_movie_dir={}",
+        "Runtime config: search_dir={} db_path={} heartbeat={}s stall_warn={}s progress_ui={} jpeg_quality={} hash_downscale={} image_queue_caps=({}, {}) movie_workers={} movie_frame_samples={} movie_queue_caps=({}, {}) movie_transcode_non_mp4={} movie_transcode_crf={} movie_transcode_preset={} movie_transcode_audio_bitrate_k={} movie_transcode_max_width={} max_console_errors={} env_overrides={} master_image_dir={} master_movie_dir={}",
         config.search_dir,
         config.db_path,
         heartbeat_secs,
@@ -290,6 +493,11 @@ fn main() -> Result<()> {
         config.movie_frame_samples,
         config.movie_path_queue_cap,
         config.movie_result_queue_cap,
+        config.movie_transcode_non_mp4,
+        config.movie_transcode_crf,
+        config.movie_transcode_preset,
+        config.movie_transcode_audio_bitrate_k,
+        config.movie_transcode_max_width,
         config.max_console_errors,
         config.env_overrides_enabled,
         config.master_image_dir,
@@ -851,7 +1059,20 @@ fn main() -> Result<()> {
             eprintln!("Movie master copy skipped: DUPCHECKER_MASTER_MOVIE_DIR is not set");
         } else if let Some(existing_conn) = conn.as_ref() {
             let movie_master_dir = PathBuf::from(&config.master_movie_dir);
-            copy_unique_movies_from_hashes(existing_conn, &movie_master_dir, progress_enabled)?;
+            let transcode_settings = MovieTranscodeSettings {
+                crf: config.movie_transcode_crf,
+                preset: config.movie_transcode_preset.clone(),
+                audio_bitrate_k: config.movie_transcode_audio_bitrate_k,
+                max_width: config.movie_transcode_max_width,
+            };
+            copy_unique_movies_from_hashes(
+                existing_conn,
+                &movie_master_dir,
+                config.movie_transcode_non_mp4,
+                &transcode_settings,
+                &mut error_log_writer,
+                progress_enabled,
+            )?;
         }
     }
 

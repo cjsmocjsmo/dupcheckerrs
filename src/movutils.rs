@@ -10,11 +10,20 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::{env, fs};
 use time::OffsetDateTime;
 use walkdir::WalkDir;
+
+#[derive(Clone)]
+pub struct MovieTranscodeSettings {
+    pub crf: u8,
+    pub preset: String,
+    pub audio_bitrate_k: u32,
+    pub max_width: u32,
+}
 
 #[derive(Clone, Copy)]
 pub enum DetectedVideoFormat {
@@ -226,6 +235,94 @@ pub fn process_movie_path(
             path: original_path,
             message,
         },
+    }
+}
+
+pub fn movie_needs_mp4_transcode(source_extension: &str, detected_format: &str) -> bool {
+    !source_extension.eq_ignore_ascii_case("mp4") || !detected_format.eq_ignore_ascii_case("mp4")
+}
+
+pub fn ensure_ffmpeg_available() -> std::result::Result<(), String> {
+    let output = Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map_err(|e| format!("ffmpeg executable is unavailable: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(format!(
+            "ffmpeg returned non-zero status while probing availability (stdout='{}', stderr='{}')",
+            stdout, stderr
+        ))
+    }
+}
+
+pub fn transcode_movie_to_mp4(
+    input_path: &Path,
+    output_path: &Path,
+    settings: &MovieTranscodeSettings,
+) -> std::result::Result<(), String> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create output directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("0:a?")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg(settings.preset.as_str())
+        .arg("-crf")
+        .arg(settings.crf.to_string())
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg(format!("{}k", settings.audio_bitrate_k))
+        .arg("-movflags")
+        .arg("+faststart");
+
+    if settings.max_width > 0 {
+        cmd.arg("-vf")
+            .arg(format!("scale='min(iw,{})':-2", settings.max_width));
+    }
+
+    let output = cmd
+        .arg(output_path)
+        .output()
+        .map_err(|e| format!("failed to execute ffmpeg transcode command: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(format!(
+            "ffmpeg transcode failed for {} -> {} (stdout='{}', stderr='{}')",
+            input_path.display(),
+            output_path.display(),
+            stdout,
+            stderr
+        ))
     }
 }
 

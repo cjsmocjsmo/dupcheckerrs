@@ -23,6 +23,11 @@ const DUPCHECKER_MOVIE_PATH_QUEUE_CAP: usize = 512;
 const DUPCHECKER_MOVIE_RESULT_QUEUE_CAP: usize = 512;
 const DUPCHECKER_MASTER_IMAGE_DIR: &str = "/media/PiTB/RustMasterPics";
 const DUPCHECKER_MASTER_MOVIE_DIR: &str = "/media/PiTB/RustMasterMovies";
+const DUPCHECKER_MOVIE_TRANSCODE_NON_MP4: bool = true;
+const DUPCHECKER_MOVIE_TRANSCODE_CRF: u8 = 20;
+const DUPCHECKER_MOVIE_TRANSCODE_PRESET: &str = "medium";
+const DUPCHECKER_MOVIE_TRANSCODE_AUDIO_BITRATE_K: u32 = 128;
+const DUPCHECKER_MOVIE_TRANSCODE_MAX_WIDTH: u32 = 0;
 
 // Optional compatibility mode: when true, environment variables can override the constants above.
 const ENABLE_ENV_OVERRIDES: bool = false;
@@ -43,6 +48,11 @@ const ENV_JPEG_QUALITY: &str = "DUPCHECKER_JPEG_QUALITY";
 const ENV_HASH_DOWNSCALE_SIZE: &str = "DUPCHECKER_HASH_DOWNSCALE_SIZE";
 const ENV_MASTER_IMAGE_DIR: &str = "DUPCHECKER_MASTER_IMAGE_DIR";
 const ENV_MASTER_MOVIE_DIR: &str = "DUPCHECKER_MASTER_MOVIE_DIR";
+const ENV_MOVIE_TRANSCODE_NON_MP4: &str = "DUPCHECKER_MOVIE_TRANSCODE_NON_MP4";
+const ENV_MOVIE_TRANSCODE_CRF: &str = "DUPCHECKER_MOVIE_TRANSCODE_CRF";
+const ENV_MOVIE_TRANSCODE_PRESET: &str = "DUPCHECKER_MOVIE_TRANSCODE_PRESET";
+const ENV_MOVIE_TRANSCODE_AUDIO_BITRATE_K: &str = "DUPCHECKER_MOVIE_TRANSCODE_AUDIO_BITRATE_K";
+const ENV_MOVIE_TRANSCODE_MAX_WIDTH: &str = "DUPCHECKER_MOVIE_TRANSCODE_MAX_WIDTH";
 
 pub struct RuntimeConfig {
     pub dry_run: bool,
@@ -66,6 +76,11 @@ pub struct RuntimeConfig {
     pub movie_result_queue_cap: usize,
     pub master_image_dir: String,
     pub master_movie_dir: String,
+    pub movie_transcode_non_mp4: bool,
+    pub movie_transcode_crf: u8,
+    pub movie_transcode_preset: String,
+    pub movie_transcode_audio_bitrate_k: u32,
+    pub movie_transcode_max_width: u32,
     pub env_overrides_enabled: bool,
 }
 
@@ -93,6 +108,11 @@ impl RuntimeConfig {
             movie_result_queue_cap: DUPCHECKER_MOVIE_RESULT_QUEUE_CAP.max(1),
             master_image_dir: DUPCHECKER_MASTER_IMAGE_DIR.to_string(),
             master_movie_dir: DUPCHECKER_MASTER_MOVIE_DIR.to_string(),
+            movie_transcode_non_mp4: DUPCHECKER_MOVIE_TRANSCODE_NON_MP4,
+            movie_transcode_crf: DUPCHECKER_MOVIE_TRANSCODE_CRF.clamp(1, 51),
+            movie_transcode_preset: DUPCHECKER_MOVIE_TRANSCODE_PRESET.to_string(),
+            movie_transcode_audio_bitrate_k: DUPCHECKER_MOVIE_TRANSCODE_AUDIO_BITRATE_K.clamp(32, 512),
+            movie_transcode_max_width: DUPCHECKER_MOVIE_TRANSCODE_MAX_WIDTH,
             env_overrides_enabled: ENABLE_ENV_OVERRIDES,
         };
 
@@ -120,6 +140,18 @@ impl RuntimeConfig {
                 movie_result_queue_cap: base.movie_result_queue_cap,
                 master_image_dir: base.master_image_dir.clone(),
                 master_movie_dir: base.master_movie_dir.clone(),
+                movie_transcode_non_mp4: env_flag(ENV_MOVIE_TRANSCODE_NON_MP4) || base.movie_transcode_non_mp4,
+                movie_transcode_crf: env_u8(ENV_MOVIE_TRANSCODE_CRF, base.movie_transcode_crf).clamp(1, 51),
+                movie_transcode_preset: env_string(ENV_MOVIE_TRANSCODE_PRESET, &base.movie_transcode_preset),
+                movie_transcode_audio_bitrate_k: env_u32(
+                    ENV_MOVIE_TRANSCODE_AUDIO_BITRATE_K,
+                    base.movie_transcode_audio_bitrate_k,
+                )
+                .clamp(32, 512),
+                movie_transcode_max_width: env_u32(
+                    ENV_MOVIE_TRANSCODE_MAX_WIDTH,
+                    base.movie_transcode_max_width,
+                ),
                 env_overrides_enabled: ENABLE_ENV_OVERRIDES,
             }
         } else {
